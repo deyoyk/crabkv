@@ -28,6 +28,12 @@ struct ServerContext {
     subscribed_channels: Arc<parking_lot::RwLock<Vec<Vec<u8>>>>,
 }
 
+impl ServerContext {
+    fn is_subscribed(&self) -> bool {
+        !self.subscribed_channels.read().is_empty()
+    }
+}
+
 impl Server {
     pub async fn new(config: Config) -> Self {
         let broadcaster = Arc::new(PubSubBroadcaster::new());
@@ -52,16 +58,16 @@ impl Server {
         let listener = TcpListener::bind(addr).await?;
         log::info!("Listening on {}", addr);
 
-        let running = self.running.clone();
         let broadcaster = self.broadcaster.clone();
         let jobs = self.jobs.clone();
         let config = self.config.clone();
         let active = self.active_connections.clone();
 
+        let signal_running = self.running.clone();
         tokio::spawn(async move {
             signal::ctrl_c().await.ok();
             log::info!("Received shutdown signal, stopping server...");
-            running.store(false, Ordering::SeqCst);
+            signal_running.store(false, Ordering::SeqCst);
         });
 
         loop {
@@ -77,15 +83,16 @@ impl Server {
                             log::debug!("New connection from {}", peer_addr);
                             active.fetch_add(1, Ordering::Relaxed);
 
+                            let sub_broadcaster = broadcaster.clone();
                             let ctx = ServerContext {
                                 config: config.clone(),
-                                broadcaster: broadcaster.clone(),
+                                broadcaster: sub_broadcaster,
                                 jobs: jobs.clone(),
                                 client_id: PubSubBroadcaster::new().next_subscriber_id(),
                                 subscribed_channels: Arc::new(parking_lot::RwLock::new(Vec::new())),
                             };
 
-                            let running = running.clone();
+                            let running = self.running.clone();
                             let active = active.clone();
                             tokio::spawn(async move {
                                 Self::handle_connection(stream, ctx, running).await;
@@ -129,7 +136,8 @@ impl Server {
                     break;
                 }
                 Ok(_) => {
-                    let trimmed = line.trim();
+                    let trimmed_str = std::str::from_utf8(&line).unwrap_or("");
+                    let trimmed = trimmed_str.trim();
                     if trimmed.is_empty() {
                         continue;
                     }
@@ -162,15 +170,13 @@ impl Server {
                         break;
                     }
 
-                    if let Some(channels) = &ctx订阅频道() {
-                        if !channels.is_empty() {
-                            for msg in response.lines() {
-                                let _ = writer
-                                    .write_all(format!("+{}\r\n", msg).as_bytes())
-                                    .await;
-                            }
-                            continue;
+                    if ctx.is_subscribed() {
+                        for msg in response.lines() {
+                            let _ = writer
+                                .write_all(format!("+{}\r\n", msg).as_bytes())
+                                .await;
                         }
+                        continue;
                     }
 
                     if let Err(e) = writer.write_all(response.as_bytes()).await {
@@ -210,41 +216,30 @@ impl Server {
             "COMMAND" | "COMMAND DOCS" | "COMMAND COUNT" | "COMMAND INFO" => {
                 "+OK\r\n".into()
             }
-            "DBSIZE" => {
-                ":0\r\n".into()
-            }
+            "DBSIZE" => ":0\r\n".into(),
             "INFO" => {
                 let section = args.get(1).map(|s| s.as_str()).unwrap_or("server");
-                match section {
+                let body = match section {
                     "server" => {
                         format!(
-                            "${}\r\n# Server\r\nredis_version:7.0.0-crabkv\r\ntcp_port:{}\r\n\r\n",
-                            0, ctx.config.server.port
+                            "# Server\r\nredis_version:7.0.0-crabkv\r\ntcp_port:{}\r\n",
+                            ctx.config.server.port
                         )
                     }
-                    "clients" => {
-                        format!(
-                            "${}\r\n# Clients\r\nconnected_clients:1\r\n\r\n",
-                            0
-                        )
-                    }
+                    "clients" => "# Clients\r\nconnected_clients:1\r\n".into(),
                     "memory" => {
                         let max = ctx.config.parse_max_memory();
-                        format!(
-                            "${}\r\n# Memory\r\nmax_memory:{}\r\n\r\n",
-                            0, max
-                        )
+                        format!("# Memory\r\nmax_memory:{}\r\n", max)
                     }
-                    _ => "+OK\r\n".into(),
-                }
+                    _ => "# Server\r\nredis_version:7.0.0-crabkv\r\n".into(),
+                };
+                format!("${}\r\n{}\r\n", body.len(), body)
             }
             "SET" => {
                 if args.len() < 3 {
                     return "-ERR wrong number of arguments for 'SET' command\r\n".into();
                 }
-                let key = args[1].clone();
-                let value = args[2].clone();
-                log::debug!("SET {} = {}", key, value);
+                log::debug!("SET {} = {}", args[1], args[2]);
                 "+OK\r\n".into()
             }
             "GET" => {
@@ -308,11 +303,9 @@ impl Server {
                 if args.len() < 3 {
                     return "-ERR wrong number of arguments for 'PUBLISH' command\r\n".into();
                 }
-                let channel = &args[1];
-                let message = &args[2];
                 let count = ctx
                     .broadcaster
-                    .publish(channel.as_bytes(), message.as_bytes());
+                    .publish(args[1].as_bytes(), args[2].as_bytes());
                 format!(":{}\r\n", count)
             }
             "PSUBSCRIBE" => {
@@ -356,113 +349,66 @@ impl Server {
             }
             "LPUSH" | "RPUSH" => {
                 if args.len() < 3 {
-                    return format!(
-                        "-ERR wrong number of arguments for '{}' command\r\n",
-                        cmd
-                    );
+                    return format!("-ERR wrong number of arguments for '{}' command\r\n", cmd);
                 }
                 format!(":{}\r\n", args.len() - 2)
             }
-            "LPOP" | "RPOP" => {
-                "$-1\r\n".into()
-            }
-            "LLEN" => {
-                ":0\r\n".into()
-            }
-            "LRANGE" => {
-                "*0\r\n".into()
-            }
+            "LPOP" | "RPOP" => "$-1\r\n".into(),
+            "LLEN" => ":0\r\n".into(),
+            "LRANGE" => "*0\r\n".into(),
             "HSET" => {
                 if args.len() < 4 {
                     return "-ERR wrong number of arguments for 'HSET' command\r\n".into();
                 }
                 ":1\r\n".into()
             }
-            "HGET" => {
-                "$-1\r\n".into()
-            }
-            "HGETALL" => {
-                "*0\r\n".into()
-            }
-            "HDEL" => {
-                ":0\r\n".into()
-            }
+            "HGET" => "$-1\r\n".into(),
+            "HGETALL" => "*0\r\n".into(),
+            "HDEL" => ":0\r\n".into(),
             "SADD" => {
                 if args.len() < 3 {
                     return "-ERR wrong number of arguments for 'SADD' command\r\n".into();
                 }
                 format!(":{}\r\n", args.len() - 2)
             }
-            "SMEMBERS" => {
-                "*0\r\n".into()
-            }
-            "SREM" => {
-                ":0\r\n".into()
-            }
+            "SMEMBERS" => "*0\r\n".into(),
+            "SREM" => ":0\r\n".into(),
             "ZADD" => {
                 if args.len() < 4 {
                     return "-ERR wrong number of arguments for 'ZADD' command\r\n".into();
                 }
                 ":1\r\n".into()
             }
-            "ZRANGE" | "ZRANGEBYSCORE" => {
-                "*0\r\n".into()
-            }
-            "ZSCORE" => {
-                "$-1\r\n".into()
-            }
+            "ZRANGE" | "ZRANGEBYSCORE" => "*0\r\n".into(),
+            "ZSCORE" => "$-1\r\n".into(),
             "INCR" | "DECR" => {
                 if args.len() < 2 {
-                    return format!(
-                        "-ERR wrong number of arguments for '{}' command\r\n",
-                        cmd
-                    );
+                    return format!("-ERR wrong number of arguments for '{}' command\r\n", cmd);
                 }
                 ":1\r\n".into()
             }
             "INCRBY" | "DECRBY" => {
                 if args.len() < 3 {
-                    return format!(
-                        "-ERR wrong number of arguments for '{}' command\r\n",
-                        cmd
-                    );
+                    return format!("-ERR wrong number of arguments for '{}' command\r\n", cmd);
                 }
                 ":1\r\n".into()
             }
             "EXPIRE" | "TTL" | "PTTL" | "PERSIST" => {
                 if args.len() < 2 {
-                    return format!(
-                        "-ERR wrong number of arguments for '{}' command\r\n",
-                        cmd
-                    );
+                    return format!("-ERR wrong number of arguments for '{}' command\r\n", cmd);
                 }
                 ":1\r\n".into()
             }
-            "KEYS" => {
-                "*0\r\n".into()
-            }
-            "TYPE" => {
-                "+none\r\n".into()
-            }
-            "FLUSHDB" | "FLUSHALL" => {
-                "+OK\r\n".into()
-            }
-            "SAVE" | "BGSAVE" => {
-                "+OK\r\n".into()
-            }
-            "LASTSAVE" => {
-                ":0\r\n".into()
-            }
+            "KEYS" => "*0\r\n".into(),
+            "TYPE" => "+none\r\n".into(),
+            "FLUSHDB" | "FLUSHALL" => "+OK\r\n".into(),
+            "SAVE" | "BGSAVE" => "+OK\r\n".into(),
+            "LASTSAVE" => ":0\r\n".into(),
             "TIME" => {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default();
-                let secs = now.as_secs();
-                let micros = now.subsec_micros();
-                format!(
-                    "*2\r\n:{}\r\n:{}\r\n",
-                    secs, micros
-                )
+                format!("*2\r\n:{}\r\n:{}\r\n", now.as_secs(), now.subsec_micros())
             }
             "CLIENT" => {
                 if args.len() < 2 {
@@ -503,52 +449,31 @@ impl Server {
                 if args.len() < 4 {
                     return "-ERR wrong number of arguments for 'XADD' command\r\n".into();
                 }
-                format!("$37\r\n1-00000000000000000000000000000000000\r\n")
+                "$37\r\n1-00000000000000000000000000000000000\r\n".into()
             }
-            "XLEN" => {
-                ":0\r\n".into()
-            }
-            "XRANGE" | "XREVRANGE" => {
-                "*0\r\n".into()
-            }
-            "XREAD" => {
-                "*0\r\n".into()
-            }
+            "XLEN" => ":0\r\n".into(),
+            "XRANGE" | "XREVRANGE" => "*0\r\n".into(),
+            "XREAD" => "*0\r\n".into(),
             "XACK" => {
                 if args.len() < 3 {
                     return "-ERR wrong number of arguments for 'XACK' command\r\n".into();
                 }
                 ":0\r\n".into()
             }
-            "XGROUP" => {
-                "+OK\r\n".into()
-            }
-            "XINFO" => {
-                "+OK\r\n".into()
-            }
-            "XCLAIM" | "XAUTOCLAIM" => {
-                "*0\r\n".into()
-            }
-            "XTRIM" => {
-                ":0\r\n".into()
-            }
-            "XDEL" => {
-                ":0\r\n".into()
-            }
-            "XCREATE" => {
-                "+OK\r\n".into()
-            }
-            "XQUEUE" => {
-                "*0\r\n".into()
-            }
+            "XGROUP" => "+OK\r\n".into(),
+            "XINFO" => "+OK\r\n".into(),
+            "XCLAIM" | "XAUTOCLAIM" => "*0\r\n".into(),
+            "XTRIM" => ":0\r\n".into(),
+            "XDEL" => ":0\r\n".into(),
+            "XCREATE" => "+OK\r\n".into(),
+            "XQUEUE" => "*0\r\n".into(),
             "JOBADD" => {
                 if args.len() < 4 {
                     return "-ERR wrong number of arguments for 'JOBADD' command\r\n".into();
                 }
-                let queue = &args[1];
                 let payload = args[2].as_bytes().to_vec();
                 let priority: i32 = args[3].parse().unwrap_or(0);
-                let id = ctx.jobs.add_job(queue, payload, priority, None);
+                let id = ctx.jobs.add_job(&args[1], payload, priority, None);
                 format!("+{}\r\n", id)
             }
             "JOBPOP" => {
@@ -575,8 +500,7 @@ impl Server {
                 if args.len() < 3 {
                     return "-ERR wrong number of arguments for 'JOBACK' command\r\n".into();
                 }
-                let success = ctx.jobs.ack_job(&args[1], &args[2]);
-                if success {
+                if ctx.jobs.ack_job(&args[1], &args[2]) {
                     "+OK\r\n".into()
                 } else {
                     "-ERR job not found\r\n".into()
@@ -586,8 +510,7 @@ impl Server {
                 if args.len() < 4 {
                     return "-ERR wrong number of arguments for 'JOBFAIL' command\r\n".into();
                 }
-                let success = ctx.jobs.fail_job(&args[1], &args[2], &args[3]);
-                if success {
+                if ctx.jobs.fail_job(&args[1], &args[2], &args[3]) {
                     "+OK\r\n".into()
                 } else {
                     "-ERR job not found\r\n".into()
@@ -597,8 +520,7 @@ impl Server {
                 if args.len() < 3 {
                     return "-ERR wrong number of arguments for 'JOBRETRY' command\r\n".into();
                 }
-                let success = ctx.jobs.retry_job(&args[1], &args[2]);
-                if success {
+                if ctx.jobs.retry_job(&args[1], &args[2]) {
                     "+OK\r\n".into()
                 } else {
                     "-ERR job not found\r\n".into()
@@ -609,10 +531,7 @@ impl Server {
                     return "-ERR wrong number of arguments for 'JOBSTATS' command\r\n".into();
                 }
                 let (pending, processing, dead) = ctx.jobs.queue_stats(&args[1]);
-                format!(
-                    "*3\r\n:{}\r\n:{}\r\n:{}\r\n",
-                    pending, processing, dead
-                )
+                format!("*3\r\n:{}\r\n:{}\r\n:{}\r\n", pending, processing, dead)
             }
             "JOBDEAD" => {
                 if args.len() < 2 {
@@ -622,41 +541,19 @@ impl Server {
                 if letters.is_empty() {
                     "*0\r\n".into()
                 } else {
-                    let mut response = format!(":{}\r\n", letters.len());
-                    for entry in &letters {
-                        response.push_str(&format!(
-                            "${}\r\n",
-                            entry.job.id.len() + entry.reason.len() + 1
-                        ));
-                    }
-                    response
+                    format!(":{}\r\n", letters.len())
                 }
             }
-            "XWORKERS" => {
-                "*0\r\n".into()
-            }
+            "XWORKERS" => "*0\r\n".into(),
             "XREPLY" => {
                 if args.len() < 3 {
                     return "-ERR wrong number of arguments for 'XREPLY' command\r\n".into();
                 }
                 "+OK\r\n".into()
             }
-            "XWATCH" => {
-                "*0\r\n".into()
-            }
-            _ => {
-                format!(
-                    "-ERR unknown command '{}'\r\n",
-                    args[0]
-                )
-            }
+            "XWATCH" => "*0\r\n".into(),
+            _ => format!("-ERR unknown command '{}'\r\n", args[0]),
         }
-    }
-}
-
-impl ServerContext {
-    fn 订阅频道(&self) -> Option<Vec<Vec<u8>>> {
-        Some(self.subscribed_channels.read().clone())
     }
 }
 
@@ -701,8 +598,7 @@ fn parse_inline(line: &str) -> Vec<String> {
 
 fn parse_resp(data: &[u8]) -> Option<Vec<String>> {
     let text = std::str::from_utf8(data).ok()?;
-    let mut args = Vec::new();
-    let mut lines: Vec<&str> = text.lines().collect();
+    let lines: Vec<&str> = text.lines().collect();
 
     if lines.is_empty() {
         return None;
@@ -716,6 +612,8 @@ fn parse_resp(data: &[u8]) -> Option<Vec<String>> {
 
     let count: usize = first_line[1..].parse().ok()?;
     i += 1;
+
+    let mut args = Vec::with_capacity(count);
 
     for _ in 0..count {
         if i >= lines.len() {
@@ -752,130 +650,212 @@ mod tests {
 
     #[test]
     fn parse_inline_simple() {
-        let args = parse_inline("PING");
-        assert_eq!(args, vec!["PING"]);
+        assert_eq!(parse_inline("PING"), vec!["PING"]);
     }
 
     #[test]
     fn parse_inline_multiple_args() {
-        let args = parse_inline("SET foo bar");
-        assert_eq!(args, vec!["SET", "foo", "bar"]);
+        assert_eq!(parse_inline("SET foo bar"), vec!["SET", "foo", "bar"]);
     }
 
     #[test]
-    fn parse_inline_with_quotes() {
-        let args = parse_inline("SET \"hello world\" baz");
-        assert_eq!(args, vec!["SET", "hello world", "baz"]);
+    fn parse_inline_with_double_quotes() {
+        assert_eq!(
+            parse_inline(r#"SET "hello world" baz"#),
+            vec!["SET", "hello world", "baz"]
+        );
     }
 
     #[test]
-    fn parse_inline_single_quotes() {
-        let args = parse_inline("SET 'hello world' baz");
-        assert_eq!(args, vec!["SET", "hello world", "baz"]);
+    fn parse_inline_with_single_quotes() {
+        assert_eq!(
+            parse_inline("SET 'hello world' baz"),
+            vec!["SET", "hello world", "baz"]
+        );
     }
 
     #[test]
     fn parse_inline_empty() {
-        let args = parse_inline("");
-        assert!(args.is_empty());
+        assert!(parse_inline("").is_empty());
     }
 
     #[test]
     fn parse_inline_extra_spaces() {
-        let args = parse_inline("  SET   foo   bar  ");
-        assert_eq!(args, vec!["SET", "foo", "bar"]);
+        assert_eq!(
+            parse_inline("  SET   foo   bar  "),
+            vec!["SET", "foo", "bar"]
+        );
     }
 
     #[test]
     fn parse_resp_simple() {
         let input = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
-        let args = parse_resp(input).unwrap();
-        assert_eq!(args, vec!["SET", "foo", "bar"]);
+        assert_eq!(parse_resp(input).unwrap(), vec!["SET", "foo", "bar"]);
     }
 
     #[test]
     fn parse_resp_single_arg() {
         let input = b"*1\r\n$4\r\nPING\r\n";
-        let args = parse_resp(input).unwrap();
-        assert_eq!(args, vec!["PING"]);
+        assert_eq!(parse_resp(input).unwrap(), vec!["PING"]);
     }
 
     #[test]
     fn parse_resp_empty_bulk_string() {
         let input = b"*2\r\n$3\r\nGET\r\n$0\r\n\r\n";
-        let args = parse_resp(input).unwrap();
-        assert_eq!(args, vec!["GET", ""]);
+        assert_eq!(parse_resp(input).unwrap(), vec!["GET", ""]);
     }
 
     #[test]
     fn parse_resp_invalid_header() {
-        let input = b"$3\r\nSET\r\n";
-        assert!(parse_resp(input).is_none());
+        assert!(parse_resp(b"$3\r\nSET\r\n").is_none());
     }
 
     #[test]
     fn parse_resp_wrong_length() {
-        let input = b"*1\r\n$5\r\nSET\r\n";
-        assert!(parse_resp(input).is_none());
+        assert!(parse_resp(b"*1\r\n$5\r\nSET\r\n").is_none());
+    }
+
+    #[test]
+    fn parse_resp_truncated() {
+        assert!(parse_resp(b"*3\r\n$3\r\nSET\r\n").is_none());
     }
 
     #[tokio::test]
     async fn ping_command() {
-        let ctx = create_test_context();
-        let args = vec!["PING".to_string()];
-        let response = Server::process_command(&args, &ctx).await;
-        assert_eq!(response, "+PONG\r\n");
+        let ctx = test_context();
+        assert_eq!(
+            Server::process_command(&["PING".into()], &ctx).await,
+            "+PONG\r\n"
+        );
     }
 
     #[tokio::test]
     async fn ping_with_arg() {
-        let ctx = create_test_context();
-        let args = vec!["PING".to_string(), "hello".to_string()];
-        let response = Server::process_command(&args, &ctx).await;
-        assert_eq!(response, "+hello\r\n");
+        let ctx = test_context();
+        assert_eq!(
+            Server::process_command(&["PING".into(), "hello".into()], &ctx).await,
+            "+hello\r\n"
+        );
     }
 
     #[tokio::test]
     async fn echo_command() {
-        let ctx = create_test_context();
-        let args = vec!["ECHO".to_string(), "foobar".to_string()];
-        let response = Server::process_command(&args, &ctx).await;
-        assert_eq!(response, "$6\r\nfoobar\r\n");
+        let ctx = test_context();
+        assert_eq!(
+            Server::process_command(&["ECHO".into(), "foobar".into()], &ctx).await,
+            "$6\r\nfoobar\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn echo_missing_arg() {
+        let ctx = test_context();
+        let resp = Server::process_command(&["ECHO".into()], &ctx).await;
+        assert!(resp.starts_with("-ERR"));
     }
 
     #[tokio::test]
     async fn set_command() {
-        let ctx = create_test_context();
-        let args = vec!["SET".to_string(), "key".to_string(), "value".to_string()];
-        let response = Server::process_command(&args, &ctx).await;
-        assert_eq!(response, "+OK\r\n");
+        let ctx = test_context();
+        assert_eq!(
+            Server::process_command(&["SET".into(), "k".into(), "v".into()], &ctx).await,
+            "+OK\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_missing_args() {
+        let ctx = test_context();
+        let resp = Server::process_command(&["SET".into(), "k".into()], &ctx).await;
+        assert!(resp.starts_with("-ERR"));
     }
 
     #[tokio::test]
     async fn get_returns_nil() {
-        let ctx = create_test_context();
-        let args = vec!["GET".to_string(), "key".to_string()];
-        let response = Server::process_command(&args, &ctx).await;
-        assert_eq!(response, "$-1\r\n");
+        let ctx = test_context();
+        assert_eq!(
+            Server::process_command(&["GET".into(), "k".into()], &ctx).await,
+            "$-1\r\n"
+        );
     }
 
     #[tokio::test]
     async fn unknown_command() {
-        let ctx = create_test_context();
-        let args = vec!["FOOBAR".to_string()];
-        let response = Server::process_command(&args, &ctx).await;
-        assert!(response.starts_with("-ERR"));
+        let ctx = test_context();
+        let resp = Server::process_command(&["FOOBAR".into()], &ctx).await;
+        assert!(resp.starts_with("-ERR unknown command"));
     }
 
     #[tokio::test]
     async fn quit_command() {
-        let ctx = create_test_context();
-        let args = vec!["QUIT".to_string()];
-        let response = Server::process_command(&args, &ctx).await;
-        assert_eq!(response, "__CLOSE__");
+        let ctx = test_context();
+        assert_eq!(
+            Server::process_command(&["QUIT".into()], &ctx).await,
+            "__CLOSE__"
+        );
     }
 
-    fn create_test_context() -> ServerContext {
+    #[tokio::test]
+    async fn publish_command() {
+        let ctx = test_context();
+        assert_eq!(
+            Server::process_command(
+                &["PUBLISH".into(), "ch".into(), "msg".into()],
+                &ctx
+            )
+            .await,
+            ":0\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_command() {
+        let ctx = test_context();
+        let resp = Server::process_command(
+            &["SUBSCRIBE".into(), "ch1".into(), "ch2".into()],
+            &ctx,
+        )
+        .await;
+        assert!(resp.contains("subscribe"));
+        assert!(resp.contains("ch1"));
+        assert!(resp.contains("ch2"));
+    }
+
+    #[tokio::test]
+    async fn client_id() {
+        let ctx = test_context();
+        let resp = Server::process_command(&["CLIENT".into(), "ID".into()], &ctx).await;
+        assert_eq!(resp, ":1\r\n");
+    }
+
+    #[tokio::test]
+    async fn time_command() {
+        let ctx = test_context();
+        let resp = Server::process_command(&["TIME".into()], &ctx).await;
+        assert!(resp.starts_with("*2\r\n:"));
+    }
+
+    #[tokio::test]
+    async fn jobadd_command() {
+        let ctx = test_context();
+        let resp = Server::process_command(
+            &["JOBADD".into(), "q".into(), "payload".into(), "0".into()],
+            &ctx,
+        )
+        .await;
+        assert!(resp.starts_with('+'));
+    }
+
+    #[tokio::test]
+    async fn jobpop_empty_queue() {
+        let ctx = test_context();
+        assert_eq!(
+            Server::process_command(&["JOBPOP".into(), "q".into()], &ctx).await,
+            "*0\r\n"
+        );
+    }
+
+    fn test_context() -> ServerContext {
         ServerContext {
             config: Config::default(),
             broadcaster: Arc::new(PubSubBroadcaster::new()),

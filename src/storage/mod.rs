@@ -1,605 +1,1624 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::hash::{BuildHasher, Hasher};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dashmap::DashMap;
+use ahash::AHasher;
 use parking_lot::RwLock;
+use rand::Rng;
 
-#[derive(Debug, Clone)]
-pub enum EntryValue {
+const DEFAULT_NUM_SHARDS: usize = 256;
+const DEFAULT_MAX_MEMORY: usize = 256 * 1024 * 1024;
+const CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
+const LFU_DECAY_WINDOW: Duration = Duration::from_secs(60);
+
+// ---------------------------------------------------------------------------
+// Core data types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StorageValue {
     String(Vec<u8>),
     List(Vec<Vec<u8>>),
     Hash(HashMap<Vec<u8>, Vec<u8>>),
     Set(HashSet<Vec<u8>>),
-    SortedSet(BTreeMap<OrderedF64, Vec<Vec<u8>>>),
+    SortedSet(BTreeSet<(i64, Vec<u8>)>),
+    Stream(StreamData),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct OrderedF64(u64);
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StreamData {
+    pub entries: Vec<StreamEntry>,
+    pub last_entry_id: u64,
+}
 
-impl OrderedF64 {
-    fn from_f64(v: f64) -> Self {
-        Self(v.to_bits())
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamEntry {
+    pub id: u64,
+    pub fields: HashMap<Vec<u8>, Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataType {
+    String,
+    List,
+    Hash,
+    Set,
+    SortedSet,
+    Stream,
+}
+
+impl StorageValue {
+    pub fn data_type(&self) -> DataType {
+        match self {
+            StorageValue::String(_) => DataType::String,
+            StorageValue::List(_) => DataType::List,
+            StorageValue::Hash(_) => DataType::Hash,
+            StorageValue::Set(_) => DataType::Set,
+            StorageValue::SortedSet(_) => DataType::SortedSet,
+            StorageValue::Stream(_) => DataType::Stream,
+        }
     }
 
-    fn to_f64(self) -> f64 {
-        f64::from_bits(self.0)
+    pub fn memory_usage(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + match self {
+                StorageValue::String(v) => v.len(),
+                StorageValue::List(v) => {
+                    v.iter().map(|e| e.len()).sum::<usize>()
+                        + v.len() * std::mem::size_of::<Vec<u8>>()
+                }
+                StorageValue::Hash(m) => {
+                    m.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>()
+                        + m.len() * (std::mem::size_of::<Vec<u8>>() * 2)
+                }
+                StorageValue::Set(s) => {
+                    s.iter().map(|e| e.len()).sum::<usize>()
+                        + s.len() * std::mem::size_of::<Vec<u8>>()
+                }
+                StorageValue::SortedSet(s) => {
+                    s.iter()
+                        .map(|(score, member)| std::mem::size_of::<i64>() + member.len())
+                        .sum::<usize>()
+                        + s.len() * std::mem::size_of::<(i64, Vec<u8>)>()
+                }
+                StorageValue::Stream(s) => {
+                    s.entries
+                        .iter()
+                        .map(|e| {
+                            std::mem::size_of::<u64>()
+                                + e.fields
+                                    .iter()
+                                    .map(|(k, v)| k.len() + v.len())
+                                    .sum::<usize>()
+                        })
+                        .sum::<usize>()
+                }
+            }
     }
 }
 
-struct ExpiryEntry {
-    expires_at: Instant,
+// ---------------------------------------------------------------------------
+// Eviction
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvictionPolicy {
+    Lfu,
+    Lru,
 }
 
-pub struct StorageEngine {
-    entries: DashMap<Vec<u8>, EntryValue>,
-    expiries: DashMap<Vec<u8>, ExpiryEntry>,
-    pub total_keys: AtomicU64,
-    shard_count: usize,
-    max_memory_bytes: usize,
+struct AccessInfo {
+    count: u64,
+    last_access: Instant,
 }
 
-impl StorageEngine {
-    pub fn new(shard_count: usize, max_memory_bytes: usize) -> Self {
+// ---------------------------------------------------------------------------
+// Expiry tracking
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct Expiry {
+    pub expires_at: Instant,
+    pub key: Vec<u8>,
+}
+
+// ---------------------------------------------------------------------------
+// Shard
+// ---------------------------------------------------------------------------
+
+pub struct Shard {
+    data: HashMap<Vec<u8>, StorageValue>,
+    ttl: HashMap<Vec<u8>, Instant>,
+    access_info: HashMap<Vec<u8>, AccessInfo>,
+    size_bytes: usize,
+}
+
+impl Shard {
+    fn new() -> Self {
         Self {
-            entries: DashMap::with_shard_amount(shard_count),
-            expiries: DashMap::with_shard_amount(shard_count),
-            total_keys: AtomicU64::new(0),
-            shard_count,
-            max_memory_bytes,
+            data: HashMap::new(),
+            ttl: HashMap::new(),
+            access_info: HashMap::new(),
+            size_bytes: 0,
+        }
+    }
+
+    fn insert(&mut self, key: Vec<u8>, value: StorageValue) {
+        if let Some(old) = self.data.get(&key) {
+            self.size_bytes -= old.memory_usage();
+        }
+        let new_usage = value.memory_usage();
+        self.data.insert(key, value);
+        self.size_bytes += new_usage;
+    }
+
+    fn remove(&mut self, key: &[u8]) -> Option<StorageValue> {
+        if let Some(val) = self.data.remove(key) {
+            self.size_bytes -= val.memory_usage();
+            self.ttl.remove(key);
+            self.access_info.remove(key);
+            Some(val)
+        } else {
+            None
         }
     }
 
     fn is_expired(&self, key: &[u8]) -> bool {
-        if let Some(entry) = self.expiries.get(key) {
-            if Instant::now() >= entry.expires_at {
-                return true;
-            }
-        }
-        false
+        self.ttl
+            .get(key)
+            .map(|exp| Instant::now() >= *exp)
+            .unwrap_or(false)
     }
 
-    fn remove_if_expired(&self, key: &[u8]) -> bool {
-        if self.is_expired(key) {
-            self.entries.remove(key);
-            self.expiries.remove(key);
-            self.total_keys.fetch_sub(1, Ordering::Relaxed);
+    fn cleanup_expired(&mut self) -> Vec<Vec<u8>> {
+        let now = Instant::now();
+        let expired: Vec<Vec<u8>> = self
+            .ttl
+            .iter()
+            .filter(|(_, exp)| now >= **exp)
+            .map(|(k, _)| k.clone())
+            .collect();
+
+        for key in &expired {
+            if let Some(val) = self.data.remove(key) {
+                self.size_bytes -= val.memory_usage();
+            }
+            self.ttl.remove(key);
+            self.access_info.remove(key);
+        }
+
+        expired
+    }
+
+    fn update_access(&mut self, key: &[u8]) {
+        let now = Instant::now();
+        let info = self.access_info.entry(key.to_vec()).or_insert(AccessInfo {
+            count: 0,
+            last_access: now,
+        });
+        info.count += 1;
+        info.last_access = now;
+    }
+
+    fn pick_victim_lfu(&self) -> Option<Vec<u8>> {
+        let now = Instant::now();
+        self.data
+            .keys()
+            .filter(|k| !self.is_expired(k))
+            .min_by_key(|k| {
+                self.access_info
+                    .get(*k)
+                    .map(|info| {
+                        let elapsed = now.duration_since(info.last_access).as_secs();
+                        let decay = elapsed / LFU_DECAY_WINDOW.as_secs().max(1);
+                        info.count.saturating_sub(decay)
+                    })
+                    .unwrap_or(0)
+            })
+            .cloned()
+    }
+
+    fn pick_victim_lru(&self) -> Option<Vec<u8>> {
+        let now = Instant::now();
+        self.data
+            .keys()
+            .filter(|k| !self.is_expired(k))
+            .min_by_key(|k| {
+                self.access_info
+                    .get(*k)
+                    .map(|info| now.duration_since(info.last_access))
+                    .unwrap_or(Duration::MAX)
+            })
+            .cloned()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StorageEngine
+// ---------------------------------------------------------------------------
+
+pub struct StorageEngine {
+    shards: Vec<RwLock<Shard>>,
+    num_shards: usize,
+    max_memory: AtomicUsize,
+    current_memory: AtomicUsize,
+    eviction_policy: RwLock<EvictionPolicy>,
+}
+
+impl StorageEngine {
+    pub fn new() -> Self {
+        Self::with_config(DEFAULT_NUM_SHARDS, DEFAULT_MAX_MEMORY, EvictionPolicy::Lru)
+    }
+
+    pub fn with_config(num_shards: usize, max_memory: usize, eviction_policy: EvictionPolicy) -> Self {
+        let num_shards = num_shards.max(1);
+        let mut shards = Vec::with_capacity(num_shards);
+        for _ in 0..num_shards {
+            shards.push(RwLock::new(Shard::new()));
+        }
+        Self {
+            shards,
+            num_shards,
+            max_memory: AtomicUsize::new(max_memory),
+            current_memory: AtomicUsize::new(0),
+            eviction_policy: RwLock::new(eviction_policy),
+        }
+    }
+
+    fn shard_index(&self, key: &[u8]) -> usize {
+        let mut hasher = AHasher::default();
+        hasher.write(key);
+        hasher.finish() as usize % self.num_shards
+    }
+
+    fn get_shard(&self, key: &[u8]) -> &RwLock<Shard> {
+        &self.shards[self.shard_index(key)]
+    }
+
+    fn evict_if_needed(&self) {
+        let current = self.current_memory.load(Ordering::Relaxed);
+        let max = self.max_memory.load(Ordering::Relaxed);
+        if current <= max {
+            return;
+        }
+
+        let policy = *self.eviction_policy.read();
+        let target = max * 80 / 100;
+
+        for shard_lock in &self.shards {
+            if self.current_memory.load(Ordering::Relaxed) <= target {
+                break;
+            }
+            let mut shard = shard_lock.write();
+            let victim = match policy {
+                EvictionPolicy::Lfu => shard.pick_victim_lfu(),
+                EvictionPolicy::Lru => shard.pick_victim_lru(),
+            };
+            if let Some(vk) = victim {
+                if let Some(val) = shard.data.remove(&vk) {
+                    let freed = val.memory_usage();
+                    self.current_memory.fetch_sub(freed, Ordering::Relaxed);
+                    shard.ttl.remove(&vk);
+                    shard.access_info.remove(&vk);
+                    shard.size_bytes -= val.memory_usage();
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Public API: key/value basics
+    // -----------------------------------------------------------------------
+
+    pub fn get(&self, key: &[u8]) -> Option<StorageValue> {
+        let shard = self.get_shard(key).read();
+        if shard.is_expired(key) {
+            return None;
+        }
+        let result = shard.data.get(key).cloned();
+        drop(shard);
+        if result.is_some() {
+            self.get_shard(key).write().update_access(key);
+        }
+        result
+    }
+
+    pub fn set(&self, key: Vec<u8>, value: StorageValue) -> Option<StorageValue> {
+        let shard_lock = self.get_shard(&key);
+        let mut shard = shard_lock.write();
+        let old = shard.data.get(&key).cloned();
+        let old_size = old.as_ref().map_or(0, |v| v.memory_usage());
+        let new_size = value.memory_usage();
+
+        shard.insert(key, value);
+        let freed = old_size;
+        drop(shard);
+
+        if freed > 0 {
+            self.current_memory.fetch_sub(freed, Ordering::Relaxed);
+        }
+        self.current_memory.fetch_add(new_size, Ordering::Relaxed);
+        self.evict_if_needed();
+
+        old
+    }
+
+    pub fn set_with_ttl(
+        &self,
+        key: Vec<u8>,
+        value: StorageValue,
+        ttl: Duration,
+    ) -> Option<StorageValue> {
+        let shard_lock = self.get_shard(&key);
+        let mut shard = shard_lock.write();
+        let old = shard.data.get(&key).cloned();
+        let old_size = old.as_ref().map_or(0, |v| v.memory_usage());
+        let new_size = value.memory_usage();
+        let expires_at = Instant::now() + ttl;
+
+        shard.insert(key.clone(), value);
+        shard.ttl.insert(key, expires_at);
+        let freed = old_size;
+        drop(shard);
+
+        if freed > 0 {
+            self.current_memory.fetch_sub(freed, Ordering::Relaxed);
+        }
+        self.current_memory.fetch_add(new_size, Ordering::Relaxed);
+        self.evict_if_needed();
+
+        old
+    }
+
+    pub fn del(&self, key: &[u8]) -> bool {
+        let shard_lock = self.get_shard(key);
+        let mut shard = shard_lock.write();
+        if let Some(val) = shard.remove(key) {
+            let size = val.memory_usage();
+            drop(shard);
+            self.current_memory.fetch_sub(size, Ordering::Relaxed);
             true
         } else {
             false
         }
     }
 
-    // --- String operations ---
-
-    pub fn set(&self, key: &[u8], value: &[u8], expiry: Option<Duration>) {
-        if self.remove_if_expired(key) || self.entries.get(key).is_none() {
-            self.total_keys.fetch_add(1, Ordering::Relaxed);
-        }
-        self.entries
-            .insert(key.to_vec(), EntryValue::String(value.to_vec()));
-        if let Some(ttl) = expiry {
-            self.expiries.insert(
-                key.to_vec(),
-                ExpiryEntry {
-                    expires_at: Instant::now() + ttl,
-                },
-            );
-        } else {
-            self.expiries.remove(key);
-        }
-    }
-
-    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        if self.remove_if_expired(key) {
-            return None;
-        }
-        self.entries.get(key).and_then(|v| match v.value() {
-            EntryValue::String(s) => Some(s.clone()),
-            _ => None,
-        })
-    }
-
-    pub fn del(&self, key: &[u8]) -> bool {
-        let existed = self.entries.remove(key).is_some();
-        self.expiries.remove(key);
-        if existed {
-            self.total_keys.fetch_sub(1, Ordering::Relaxed);
-        }
-        existed
-    }
-
     pub fn exists(&self, key: &[u8]) -> bool {
-        if self.remove_if_expired(key) {
-            return false;
-        }
-        self.entries.contains_key(key)
+        let shard = self.get_shard(key).read();
+        shard.data.contains_key(key) && !shard.is_expired(key)
     }
 
-    pub fn incr(&self, key: &[u8]) -> Result<i64, String> {
-        if self.remove_if_expired(key) {
-            self.total_keys.fetch_add(1, Ordering::Relaxed);
-            self.entries
-                .insert(key.to_vec(), EntryValue::String(b"1".to_vec()));
-            return Ok(1);
-        }
-        match self.entries.get(key) {
-            Some(entry) => match entry.value() {
-                EntryValue::String(s) => {
-                    let n: i64 = std::str::from_utf8(s)
-                        .map_err(|_| "ERR not an integer".to_string())?
-                        .parse()
-                        .map_err(|_| "ERR not an integer".to_string())?;
-                    let new_val = n + 1;
-                    drop(entry);
-                    self.entries.insert(
-                        key.to_vec(),
-                        EntryValue::String(new_val.to_string().into_bytes()),
-                    );
-                    Ok(new_val)
-                }
-                _ => Err("ERR wrong type".to_string()),
-            },
-            None => {
-                self.total_keys.fetch_add(1, Ordering::Relaxed);
-                self.entries
-                    .insert(key.to_vec(), EntryValue::String(b"1".to_vec()));
-                Ok(1)
-            }
+    pub fn mget(&self, keys: &[Vec<u8>]) -> Vec<Option<StorageValue>> {
+        keys.iter().map(|k| self.get(k)).collect()
+    }
+
+    pub fn mset(&self, pairs: Vec<(Vec<u8>, StorageValue)>) {
+        for (key, value) in pairs {
+            self.set(key, value);
         }
     }
 
-    pub fn decr(&self, key: &[u8]) -> Result<i64, String> {
-        if self.remove_if_expired(key) {
-            self.total_keys.fetch_add(1, Ordering::Relaxed);
-            self.entries
-                .insert(key.to_vec(), EntryValue::String(b"-1".to_vec()));
-            return Ok(-1);
+    // -----------------------------------------------------------------------
+    // Numeric operations
+    // -----------------------------------------------------------------------
+
+    pub fn incr(&self, key: &[u8], amount: i64) -> Result<i64, String> {
+        let shard_lock = self.get_shard(key);
+        let mut shard = shard_lock.write();
+
+        if shard.is_expired(key) {
+            let result = amount;
+            let new_bytes = result.to_string().into_bytes();
+            let new_val = StorageValue::String(new_bytes);
+            let new_size = new_val.memory_usage();
+            shard.insert(key.to_vec(), new_val);
+            shard.ttl.remove(key);
+            drop(shard);
+            self.current_memory.fetch_add(new_size, Ordering::Relaxed);
+            self.evict_if_needed();
+            return Ok(result);
         }
-        match self.entries.get(key) {
-            Some(entry) => match entry.value() {
-                EntryValue::String(s) => {
-                    let n: i64 = std::str::from_utf8(s)
-                        .map_err(|_| "ERR not an integer".to_string())?
-                        .parse()
-                        .map_err(|_| "ERR not an integer".to_string())?;
-                    let new_val = n - 1;
-                    drop(entry);
-                    self.entries.insert(
-                        key.to_vec(),
-                        EntryValue::String(new_val.to_string().into_bytes()),
-                    );
-                    Ok(new_val)
-                }
-                _ => Err("ERR wrong type".to_string()),
-            },
-            None => {
-                self.total_keys.fetch_add(1, Ordering::Relaxed);
-                self.entries.insert(
-                    key.to_vec(),
-                    EntryValue::String(b"-1".to_vec()),
-                );
-                Ok(-1)
+
+        let current = match shard.data.get(key) {
+            Some(StorageValue::String(s)) => {
+                let str_val = std::str::from_utf8(s).map_err(|_| "value is not an integer")?;
+                str_val
+                    .parse::<i64>()
+                    .map_err(|_| "value is not an integer")?
             }
+            Some(_) => return Err("wrong type for key".into()),
+            None => {
+                let result = amount;
+                let new_bytes = result.to_string().into_bytes();
+                let new_val = StorageValue::String(new_bytes);
+                let new_size = new_val.memory_usage();
+                shard.insert(key.to_vec(), new_val);
+                drop(shard);
+                self.current_memory.fetch_add(new_size, Ordering::Relaxed);
+                self.evict_if_needed();
+                return Ok(result);
+            }
+        };
+
+        let result = current.checked_add(amount).ok_or("increment would overflow")?;
+        let new_bytes = result.to_string().into_bytes();
+        let new_val = StorageValue::String(new_bytes);
+        let new_size = new_val.memory_usage();
+
+        shard.insert(key.to_vec(), new_val);
+        drop(shard);
+
+        Ok(result)
+    }
+
+    pub fn decr(&self, key: &[u8], amount: i64) -> Result<i64, String> {
+        self.incr(key, -amount)
+    }
+
+    // -----------------------------------------------------------------------
+    // TTL operations
+    // -----------------------------------------------------------------------
+
+    pub fn expire(&self, key: &[u8], ttl: Duration) -> bool {
+        let shard_lock = self.get_shard(key);
+        let mut shard = shard_lock.write();
+        if shard.data.contains_key(key) && !shard.is_expired(key) {
+            shard
+                .ttl
+                .insert(key.to_vec(), Instant::now() + ttl);
+            true
+        } else {
+            false
         }
     }
 
     pub fn ttl(&self, key: &[u8]) -> Option<Duration> {
-        if !self.exists(key) {
+        let shard = self.get_shard(key).read();
+        if !shard.data.contains_key(key) {
             return None;
         }
-        self.expiries.get(key).and_then(|e| {
+        if shard.is_expired(key) {
+            return Some(Duration::ZERO);
+        }
+        shard.ttl.get(key).map(|exp| {
             let now = Instant::now();
-            if e.expires_at > now {
-                Some(e.expires_at - now)
+            if now >= *exp {
+                Duration::ZERO
             } else {
-                None
+                *exp - now
             }
         })
     }
 
     pub fn persist(&self, key: &[u8]) -> bool {
-        self.expiries.remove(key).is_some()
-    }
-
-    // --- MSET / MGET ---
-
-    pub fn mset(&self, pairs: &[(&[u8], &[u8])]) {
-        for (key, value) in pairs {
-            self.set(key, value, None);
+        let shard_lock = self.get_shard(key);
+        let mut shard = shard_lock.write();
+        if shard.data.contains_key(key) {
+            shard.ttl.remove(key);
+            true
+        } else {
+            false
         }
     }
 
-    pub fn mget(&self, keys: &[&[u8]]) -> Vec<Option<Vec<u8>>> {
-        keys.iter().map(|k| self.get(k)).collect()
+    // -----------------------------------------------------------------------
+    // String operations
+    // -----------------------------------------------------------------------
+
+    pub fn append(&self, key: &[u8], data: &[u8]) -> Result<usize, String> {
+        let shard_lock = self.get_shard(key);
+        let mut shard = shard_lock.write();
+
+        if shard.is_expired(key) {
+            return Err("key does not exist".into());
+        }
+
+        match shard.data.get_mut(key) {
+            Some(StorageValue::String(s)) => {
+                let old_size = s.len();
+                s.extend_from_slice(data);
+                let new_len = s.len();
+                let diff = (new_len as isize) - (old_size as isize);
+                drop(shard);
+                if diff > 0 {
+                    self.current_memory
+                        .fetch_add(diff as usize, Ordering::Relaxed);
+                }
+                Ok(new_len)
+            }
+            Some(_) => Err("wrong type for key".into()),
+            None => {
+                let val = StorageValue::String(data.to_vec());
+                let new_size = val.memory_usage();
+                shard.insert(key.to_vec(), val);
+                drop(shard);
+                self.current_memory
+                    .fetch_add(new_size, Ordering::Relaxed);
+                self.evict_if_needed();
+                Ok(data.len())
+            }
+        }
     }
 
-    // --- List operations ---
+    pub fn strlen(&self, key: &[u8]) -> Result<usize, String> {
+        let shard = self.get_shard(key).read();
+        if shard.is_expired(key) {
+            return Err("key does not exist".into());
+        }
+        match shard.data.get(key) {
+            Some(StorageValue::String(s)) => Ok(s.len()),
+            Some(_) => Err("wrong type for key".into()),
+            None => Err("key does not exist".into()),
+        }
+    }
 
-    pub fn lpush(&self, key: &[u8], values: &[&[u8]]) -> Result<usize, String> {
-        self.remove_if_expired(key);
-        match self.entries.get_mut(key) {
-            Some(mut entry) => match entry.value_mut() {
-                EntryValue::List(list) => {
-                    for v in values.iter().rev() {
-                        list.insert(0, v.to_vec());
-                    }
-                    Ok(list.len())
+    pub fn getrange(&self, key: &[u8], start: i64, end: i64) -> Result<Vec<u8>, String> {
+        let shard = self.get_shard(key).read();
+        if shard.is_expired(key) {
+            return Err("key does not exist".into());
+        }
+        match shard.data.get(key) {
+            Some(StorageValue::String(s)) => {
+                let len = s.len() as i64;
+                let start = if start < 0 { (len + start).max(0) } else { start };
+                let end = if end < 0 { len + end } else { end.min(len - 1) };
+                if start > end || start >= len {
+                    return Ok(Vec::new());
                 }
-                _ => Err("ERR wrong type".to_string()),
-            },
-            None => {
-                let mut list = Vec::new();
+                Ok(s[start as usize..=end as usize].to_vec())
+            }
+            Some(_) => Err("wrong type for key".into()),
+            None => Err("key does not exist".into()),
+        }
+    }
+
+    pub fn setrange(&self, key: &[u8], offset: usize, data: &[u8]) -> Result<usize, String> {
+        let shard_lock = self.get_shard(key);
+        let mut shard = shard_lock.write();
+
+        if shard.is_expired(key) {
+            return Err("key does not exist".into());
+        }
+
+        match shard.data.get_mut(key) {
+            Some(StorageValue::String(s)) => {
+                let old_len = s.len();
+                let needed = offset + data.len();
+                if needed > old_len {
+                    s.resize(needed, 0);
+                }
+                s[offset..offset + data.len()].copy_from_slice(data);
+                let new_len = s.len();
+                let diff = (new_len as isize) - (old_len as isize);
+                let final_len = new_len;
+                drop(shard);
+                if diff > 0 {
+                    self.current_memory
+                        .fetch_add(diff as usize, Ordering::Relaxed);
+                }
+                Ok(final_len)
+            }
+            Some(_) => Err("wrong type for key".into()),
+            None => Err("key does not exist".into()),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Type command
+    // -----------------------------------------------------------------------
+
+    pub fn r#type(&self, key: &[u8]) -> Option<DataType> {
+        let shard = self.get_shard(key).read();
+        if shard.is_expired(key) {
+            return None;
+        }
+        shard.data.get(key).map(|v| v.data_type())
+    }
+
+    // -----------------------------------------------------------------------
+    // List operations
+    // -----------------------------------------------------------------------
+
+    pub fn lpush(&self, key: &[u8], values: Vec<Vec<u8>>) -> Result<usize, String> {
+        let shard_lock = self.get_shard(key);
+        let mut shard = shard_lock.write();
+
+        if shard.is_expired(key) {
+            return Err("key does not exist".into());
+        }
+
+        match shard.data.get_mut(key) {
+            Some(StorageValue::List(list)) => {
+                let old_size: usize = list.iter().map(|e| e.len()).sum();
                 for v in values.iter().rev() {
-                    list.insert(0, v.to_vec());
+                    list.insert(0, v.clone());
                 }
+                let new_size: usize = list.iter().map(|e| e.len()).sum();
                 let len = list.len();
-                self.entries
-                    .insert(key.to_vec(), EntryValue::List(list));
-                self.total_keys.fetch_add(1, Ordering::Relaxed);
+                let diff = (new_size as isize) - (old_size as isize);
+                drop(shard);
+                if diff > 0 {
+                    self.current_memory
+                        .fetch_add(diff as usize, Ordering::Relaxed);
+                }
                 Ok(len)
             }
-        }
-    }
-
-    pub fn rpush(&self, key: &[u8], values: &[&[u8]]) -> Result<usize, String> {
-        self.remove_if_expired(key);
-        match self.entries.get_mut(key) {
-            Some(mut entry) => match entry.value_mut() {
-                EntryValue::List(list) => {
-                    for v in values {
-                        list.push(v.to_vec());
-                    }
-                    Ok(list.len())
-                }
-                _ => Err("ERR wrong type".to_string()),
-            },
+            Some(_) => Err("wrong type for key".into()),
             None => {
-                let list: Vec<Vec<u8>> = values.iter().map(|v| v.to_vec()).collect();
+                let list: Vec<Vec<u8>> = values.into_iter().rev().collect();
                 let len = list.len();
-                self.entries
-                    .insert(key.to_vec(), EntryValue::List(list));
-                self.total_keys.fetch_add(1, Ordering::Relaxed);
+                let val = StorageValue::List(list);
+                let mem = val.memory_usage();
+                shard.insert(key.to_vec(), val);
+                drop(shard);
+                self.current_memory
+                    .fetch_add(mem, Ordering::Relaxed);
+                self.evict_if_needed();
                 Ok(len)
             }
         }
     }
 
-    pub fn lpop(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.remove_if_expired(key);
-        self.entries.get_mut(key).and_then(|mut entry| {
-            match entry.value_mut() {
-                EntryValue::List(list) => {
-                    let v = list.remove(0);
-                    if list.is_empty() {
-                        drop(entry);
-                        self.entries.remove(key);
-                        self.total_keys.fetch_sub(1, Ordering::Relaxed);
-                    }
-                    Some(v)
+    pub fn rpush(&self, key: &[u8], values: Vec<Vec<u8>>) -> Result<usize, String> {
+        let shard_lock = self.get_shard(key);
+        let mut shard = shard_lock.write();
+
+        if shard.is_expired(key) {
+            return Err("key does not exist".into());
+        }
+
+        match shard.data.get_mut(key) {
+            Some(StorageValue::List(list)) => {
+                let old_size: usize = list.iter().map(|e| e.len()).sum();
+                for v in values {
+                    list.push(v);
                 }
-                _ => None,
+                let new_size: usize = list.iter().map(|e| e.len()).sum();
+                let len = list.len();
+                let diff = (new_size as isize) - (old_size as isize);
+                drop(shard);
+                if diff > 0 {
+                    self.current_memory
+                        .fetch_add(diff as usize, Ordering::Relaxed);
+                }
+                Ok(len)
             }
-        })
+            Some(_) => Err("wrong type for key".into()),
+            None => {
+                let len = values.len();
+                let val = StorageValue::List(values);
+                let mem = val.memory_usage();
+                shard.insert(key.to_vec(), val);
+                drop(shard);
+                self.current_memory
+                    .fetch_add(mem, Ordering::Relaxed);
+                self.evict_if_needed();
+                Ok(len)
+            }
+        }
     }
 
-    pub fn rpop(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.remove_if_expired(key);
-        self.entries.get_mut(key).and_then(|mut entry| {
-            match entry.value_mut() {
-                EntryValue::List(list) => {
-                    let v = list.pop()?;
-                    if list.is_empty() {
-                        drop(entry);
-                        self.entries.remove(key);
-                        self.total_keys.fetch_sub(1, Ordering::Relaxed);
-                    }
-                    Some(v)
+    pub fn lpop(&self, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        let shard_lock = self.get_shard(key);
+        let mut shard = shard_lock.write();
+
+        if shard.is_expired(key) {
+            return Err("key does not exist".into());
+        }
+
+        match shard.data.get_mut(key) {
+            Some(StorageValue::List(list)) => {
+                if list.is_empty() {
+                    return Ok(None);
                 }
-                _ => None,
+                let item = list.remove(0);
+                let removed_size = item.len() + std::mem::size_of::<Vec<u8>>();
+                drop(shard);
+                self.current_memory
+                    .fetch_sub(removed_size, Ordering::Relaxed);
+                Ok(Some(item))
             }
-        })
+            Some(_) => Err("wrong type for key".into()),
+            None => Ok(None),
+        }
     }
 
-    pub fn lrange(&self, key: &[u8], start: isize, stop: isize) -> Vec<Vec<u8>> {
-        self.remove_if_expired(key);
-        self.entries.get(key).map(|entry| {
-            match entry.value() {
-                EntryValue::List(list) => {
-                    let len = list.len() as isize;
-                    let s = if start < 0 { start + len } else { start }.max(0) as usize;
-                    let e = if stop < 0 { stop + len } else { stop };
-                    let e = if e >= len { len - 1 } else { e as usize };
-                    if s > e || s >= list.len() {
-                        Vec::new()
-                    } else {
-                        list[s..=e].to_vec()
-                    }
+    pub fn rpop(&self, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        let shard_lock = self.get_shard(key);
+        let mut shard = shard_lock.write();
+
+        if shard.is_expired(key) {
+            return Err("key does not exist".into());
+        }
+
+        match shard.data.get_mut(key) {
+            Some(StorageValue::List(list)) => {
+                if list.is_empty() {
+                    return Ok(None);
                 }
-                _ => Vec::new(),
+                let item = list.pop().unwrap();
+                let removed_size = item.len() + std::mem::size_of::<Vec<u8>>();
+                drop(shard);
+                self.current_memory
+                    .fetch_sub(removed_size, Ordering::Relaxed);
+                Ok(Some(item))
             }
-        }).unwrap_or_default()
+            Some(_) => Err("wrong type for key".into()),
+            None => Ok(None),
+        }
     }
 
-    pub fn llen(&self, key: &[u8]) -> usize {
-        self.remove_if_expired(key);
-        self.entries.get(key).map(|entry| {
-            match entry.value() {
-                EntryValue::List(list) => list.len(),
-                _ => 0,
+    pub fn lrange(&self, key: &[u8], start: i64, stop: i64) -> Result<Vec<Vec<u8>>, String> {
+        let shard = self.get_shard(key).read();
+        if shard.is_expired(key) {
+            return Err("key does not exist".into());
+        }
+        match shard.data.get(key) {
+            Some(StorageValue::List(list)) => {
+                let len = list.len() as i64;
+                let start = if start < 0 { (len + start).max(0) } else { start };
+                let stop = if stop < 0 { len + stop } else { stop.min(len - 1) };
+                if start > stop || start >= len {
+                    return Ok(Vec::new());
+                }
+                Ok(list[start as usize..=stop as usize].to_vec())
             }
-        }).unwrap_or(0)
+            Some(_) => Err("wrong type for key".into()),
+            None => Ok(Vec::new()),
+        }
     }
 
-    // --- Hash operations ---
+    pub fn lindex(&self, key: &[u8], index: i64) -> Result<Option<Vec<u8>>, String> {
+        let shard = self.get_shard(key).read();
+        if shard.is_expired(key) {
+            return Err("key does not exist".into());
+        }
+        match shard.data.get(key) {
+            Some(StorageValue::List(list)) => {
+                let actual = if index < 0 {
+                    (list.len() as i64 + index) as usize
+                } else {
+                    index as usize
+                };
+                Ok(list.get(actual).cloned())
+            }
+            Some(_) => Err("wrong type for key".into()),
+            None => Ok(None),
+        }
+    }
 
-    pub fn hset(&self, key: &[u8], field: &[u8], value: &[u8]) -> Result<bool, String> {
-        self.remove_if_expired(key);
-        match self.entries.get_mut(key) {
-            Some(mut entry) => match entry.value_mut() {
-                EntryValue::Hash(map) => {
-                    let existed = map.insert(field.to_vec(), value.to_vec()).is_some();
-                    Ok(!existed)
+    pub fn lset(&self, key: &[u8], index: i64, value: Vec<u8>) -> Result<(), String> {
+        let shard_lock = self.get_shard(key);
+        let mut shard = shard_lock.write();
+
+        if shard.is_expired(key) {
+            return Err("key does not exist".into());
+        }
+
+        match shard.data.get_mut(key) {
+            Some(StorageValue::List(list)) => {
+                let actual = if index < 0 {
+                    (list.len() as i64 + index) as usize
+                } else {
+                    index as usize
+                };
+                if actual >= list.len() {
+                    return Err("index out of range".into());
                 }
-                _ => Err("ERR wrong type".to_string()),
-            },
+                let old_size = list[actual].len();
+                list[actual] = value.clone();
+                let new_size = value.len();
+                let diff = (new_size as isize) - (old_size as isize);
+                drop(shard);
+                if diff > 0 {
+                    self.current_memory
+                        .fetch_add(diff as usize, Ordering::Relaxed);
+                } else if diff < 0 {
+                    self.current_memory
+                        .fetch_sub((-diff) as usize, Ordering::Relaxed);
+                }
+                Ok(())
+            }
+            Some(_) => Err("wrong type for key".into()),
+            None => Err("key does not exist".into()),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Hash operations
+    // -----------------------------------------------------------------------
+
+    pub fn hset(&self, key: &[u8], field: Vec<u8>, value: Vec<u8>) -> Result<bool, String> {
+        let shard_lock = self.get_shard(key);
+        let mut shard = shard_lock.write();
+
+        if shard.is_expired(key) {
+            return Err("key does not exist".into());
+        }
+
+        match shard.data.get_mut(key) {
+            Some(StorageValue::Hash(map)) => {
+                let existed = map.contains_key(&field);
+                let old_mem: usize = map.iter().map(|(k, v)| k.len() + v.len()).sum();
+                map.insert(field, value);
+                let new_mem: usize = map.iter().map(|(k, v)| k.len() + v.len()).sum();
+                let diff = (new_mem as isize) - (old_mem as isize);
+                drop(shard);
+                if diff > 0 {
+                    self.current_memory
+                        .fetch_add(diff as usize, Ordering::Relaxed);
+                } else if diff < 0 {
+                    self.current_memory
+                        .fetch_sub((-diff) as usize, Ordering::Relaxed);
+                }
+                Ok(!existed)
+            }
+            Some(_) => Err("wrong type for key".into()),
             None => {
                 let mut map = HashMap::new();
-                map.insert(field.to_vec(), value.to_vec());
-                self.entries.insert(key.to_vec(), EntryValue::Hash(map));
-                self.total_keys.fetch_add(1, Ordering::Relaxed);
+                map.insert(field, value);
+                let val = StorageValue::Hash(map);
+                let mem = val.memory_usage();
+                shard.insert(key.to_vec(), val);
+                drop(shard);
+                self.current_memory
+                    .fetch_add(mem, Ordering::Relaxed);
+                self.evict_if_needed();
                 Ok(true)
             }
         }
     }
 
-    pub fn hget(&self, key: &[u8], field: &[u8]) -> Option<Vec<u8>> {
-        self.remove_if_expired(key);
-        self.entries.get(key).and_then(|entry| {
-            match entry.value() {
-                EntryValue::Hash(map) => map.get(field).cloned(),
-                _ => None,
-            }
-        })
-    }
-
-    pub fn hdel(&self, key: &[u8], field: &[u8]) -> bool {
-        self.remove_if_expired(key);
-        self.entries.get_mut(key).map(|mut entry| {
-            match entry.value_mut() {
-                EntryValue::Hash(map) => {
-                    let existed = map.remove(field).is_some();
-                    if map.is_empty() {
-                        drop(entry);
-                        self.entries.remove(key);
-                        self.total_keys.fetch_sub(1, Ordering::Relaxed);
-                    }
-                    existed
-                }
-                _ => false,
-            }
-        }).unwrap_or(false)
-    }
-
-    pub fn hgetall(&self, key: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
-        self.remove_if_expired(key);
-        self.entries.get(key).map(|entry| {
-            match entry.value() {
-                EntryValue::Hash(map) => map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-                _ => Vec::new(),
-            }
-        }).unwrap_or_default()
-    }
-
-    // --- Set operations ---
-
-    pub fn sadd(&self, key: &[u8], members: &[&[u8]]) -> Result<usize, String> {
-        self.remove_if_expired(key);
-        match self.entries.get_mut(key) {
-            Some(mut entry) => match entry.value_mut() {
-                EntryValue::Set(set) => {
-                    let mut added = 0;
-                    for m in members {
-                        if set.insert(m.to_vec()) {
-                            added += 1;
-                        }
-                    }
-                    Ok(added)
-                }
-                _ => Err("ERR wrong type".to_string()),
-            },
-            None => {
-                let mut set = HashSet::new();
-                for m in members {
-                    set.insert(m.to_vec());
-                }
-                let len = set.len();
-                self.entries.insert(key.to_vec(), EntryValue::Set(set));
-                self.total_keys.fetch_add(1, Ordering::Relaxed);
-                Ok(len)
-            }
+    pub fn hget(&self, key: &[u8], field: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        let shard = self.get_shard(key).read();
+        if shard.is_expired(key) {
+            return Err("key does not exist".into());
+        }
+        match shard.data.get(key) {
+            Some(StorageValue::Hash(map)) => Ok(map.get(field).cloned()),
+            Some(_) => Err("wrong type for key".into()),
+            None => Ok(None),
         }
     }
 
-    pub fn srem(&self, key: &[u8], members: &[&[u8]]) -> Result<usize, String> {
-        self.remove_if_expired(key);
-        self.entries.get_mut(key).map(|mut entry| {
-            match entry.value_mut() {
-                EntryValue::Set(set) => {
-                    let mut removed = 0;
-                    for m in members {
-                        if set.remove(*m) {
-                            removed += 1;
-                        }
-                    }
-                    if set.is_empty() {
-                        drop(entry);
-                        self.entries.remove(key);
-                        self.total_keys.fetch_sub(1, Ordering::Relaxed);
-                    }
-                    Ok(removed)
-                }
-                _ => Err("ERR wrong type".to_string()),
-            }
-        }).unwrap_or(Ok(0))
-    }
+    pub fn hdel(&self, key: &[u8], field: &[u8]) -> Result<bool, String> {
+        let shard_lock = self.get_shard(key);
+        let mut shard = shard_lock.write();
 
-    pub fn smembers(&self, key: &[u8]) -> Vec<Vec<u8>> {
-        self.remove_if_expired(key);
-        self.entries.get(key).map(|entry| {
-            match entry.value() {
-                EntryValue::Set(set) => set.iter().cloned().collect(),
-                _ => Vec::new(),
-            }
-        }).unwrap_or_default()
-    }
-
-    pub fn sismember(&self, key: &[u8], member: &[u8]) -> bool {
-        self.remove_if_expired(key);
-        self.entries.get(key).map(|entry| {
-            match entry.value() {
-                EntryValue::Set(set) => set.contains(member),
-                _ => false,
-            }
-        }).unwrap_or(false)
-    }
-
-    // --- Sorted Set operations ---
-
-    pub fn zadd(&self, key: &[u8], score: f64, member: &[u8]) -> Result<bool, String> {
-        self.remove_if_expired(key);
-        match self.entries.get_mut(key) {
-            Some(mut entry) => match entry.value_mut() {
-                EntryValue::SortedSet(zset) => {
-                    // Remove old entry if exists (we need to find by member)
-                    let old_score = zset.values().flatten().position(|m| m == member);
-                    if let Some(pos) = old_score {
-                        // Find and remove old score entry
-                        let keys_to_fix: Vec<(OrderedF64, Vec<Vec<u8>>)> = zset.iter()
-                            .map(|(k, v)| (*k, v.clone()))
-                            .collect();
-                        for (k, mut v) in keys_to_fix {
-                            if let Some(idx) = v.iter().position(|m| m == member) {
-                                v.remove(idx);
-                                if v.is_empty() {
-                                    zset.remove(&k);
-                                } else {
-                                    zset.insert(k, v);
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    let ordered = OrderedF64::from_f64(score);
-                    zset.entry(ordered)
-                        .or_insert_with(Vec::new)
-                        .push(member.to_vec());
-                    Ok(old_score.is_none())
-                }
-                _ => Err("ERR wrong type".to_string()),
-            },
-            None => {
-                let mut zset = BTreeMap::new();
-                let ordered = OrderedF64::from_f64(score);
-                zset.insert(ordered, vec![member.to_vec()]);
-                self.entries.insert(key.to_vec(), EntryValue::SortedSet(zset));
-                self.total_keys.fetch_add(1, Ordering::Relaxed);
-                Ok(true)
-            }
+        if shard.is_expired(key) {
+            return Err("key does not exist".into());
         }
-    }
 
-    pub fn zrem(&self, key: &[u8], member: &[u8]) -> Result<bool, String> {
-        self.remove_if_expired(key);
-        self.entries.get_mut(key).map(|mut entry| {
-            match entry.value_mut() {
-                EntryValue::SortedSet(zset) => {
-                    let keys_to_fix: Vec<(OrderedF64, Vec<Vec<u8>>)> = zset.iter()
-                        .map(|(k, v)| (*k, v.clone()))
-                        .collect();
-                    for (k, mut v) in keys_to_fix {
-                        if let Some(idx) = v.iter().position(|m| m == member) {
-                            v.remove(idx);
-                            if v.is_empty() {
-                                zset.remove(&k);
-                            } else {
-                                zset.insert(k, v);
-                            }
-                            if zset.is_empty() {
-                                drop(entry);
-                                self.entries.remove(key);
-                                self.total_keys.fetch_sub(1, Ordering::Relaxed);
-                            }
-                            return Ok(true);
-                        }
-                    }
+        match shard.data.get_mut(key) {
+            Some(StorageValue::Hash(map)) => {
+                if let Some(val) = map.remove(field) {
+                    let removed_size = field.len() + val.len();
+                    drop(shard);
+                    self.current_memory
+                        .fetch_sub(removed_size, Ordering::Relaxed);
+                    Ok(true)
+                } else {
                     Ok(false)
                 }
-                _ => Err("ERR wrong type".to_string()),
             }
-        }).unwrap_or(Ok(false))
+            Some(_) => Err("wrong type for key".into()),
+            None => Ok(false),
+        }
     }
 
-    pub fn zrange(&self, key: &[u8], start: isize, stop: isize) -> Vec<(Vec<u8>, f64)> {
-        self.remove_if_expired(key);
-        self.entries.get(key).map(|entry| {
-            match entry.value() {
-                EntryValue::SortedSet(zset) => {
-                    let items: Vec<_> = zset.iter()
-                        .flat_map(|(score, members)| {
-                            members.iter().map(move |m| (m.clone(), score.to_f64()))
-                        })
-                        .collect();
-                    let len = items.len() as isize;
-                    let s = if start < 0 { start + len } else { start }.max(0) as usize;
-                    let e = if stop < 0 { stop + len } else { stop };
-                    let e = if e >= len { len - 1 } else { e as usize };
-                    if s > e || s >= items.len() {
-                        Vec::new()
-                    } else {
-                        items[s..=e].to_vec()
+    pub fn hgetall(&self, key: &[u8]) -> Result<HashMap<Vec<u8>, Vec<u8>>, String> {
+        let shard = self.get_shard(key).read();
+        if shard.is_expired(key) {
+            return Err("key does not exist".into());
+        }
+        match shard.data.get(key) {
+            Some(StorageValue::Hash(map)) => Ok(map.clone()),
+            Some(_) => Err("wrong type for key".into()),
+            None => Ok(HashMap::new()),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Set operations
+    // -----------------------------------------------------------------------
+
+    pub fn sadd(&self, key: &[u8], members: Vec<Vec<u8>>) -> Result<usize, String> {
+        let shard_lock = self.get_shard(key);
+        let mut shard = shard_lock.write();
+
+        if shard.is_expired(key) {
+            return Err("key does not exist".into());
+        }
+
+        match shard.data.get_mut(key) {
+            Some(StorageValue::Set(set)) => {
+                let old_size: usize = set.iter().map(|e| e.len()).sum();
+                let mut added = 0;
+                for m in members {
+                    if set.insert(m) {
+                        added += 1;
                     }
                 }
-                _ => Vec::new(),
-            }
-        }).unwrap_or_default()
-    }
-
-    pub fn zrank(&self, key: &[u8], member: &[u8]) -> Option<usize> {
-        self.remove_if_expired(key);
-        self.entries.get(key).and_then(|entry| {
-            match entry.value() {
-                EntryValue::SortedSet(zset) => {
-                    let items: Vec<_> = zset.iter()
-                        .flat_map(|(score, members)| {
-                            members.iter().map(move |m| (m.clone(), score.to_f64()))
-                        })
-                        .collect();
-                    items.iter().position(|(m, _)| m == member)
+                let new_size: usize = set.iter().map(|e| e.len()).sum();
+                let diff = (new_size as isize) - (old_size as isize);
+                drop(shard);
+                if diff > 0 {
+                    self.current_memory
+                        .fetch_add(diff as usize, Ordering::Relaxed);
                 }
-                _ => None,
+                Ok(added)
             }
-        })
-    }
-
-    pub fn zscore(&self, key: &[u8], member: &[u8]) -> Option<f64> {
-        self.remove_if_expired(key);
-        self.entries.get(key).and_then(|entry| {
-            match entry.value() {
-                EntryValue::SortedSet(zset) => {
-                    for (score, members) in zset.iter() {
-                        if members.iter().any(|m| m == member) {
-                            return Some(score.to_f64());
-                        }
+            Some(_) => Err("wrong type for key".into()),
+            None => {
+                let mut set = HashSet::new();
+                let mut added = 0;
+                for m in members {
+                    if set.insert(m) {
+                        added += 1;
                     }
-                    None
                 }
-                _ => None,
+                let val = StorageValue::Set(set);
+                let mem = val.memory_usage();
+                shard.insert(key.to_vec(), val);
+                drop(shard);
+                self.current_memory
+                    .fetch_add(mem, Ordering::Relaxed);
+                self.evict_if_needed();
+                Ok(added)
             }
-        })
+        }
     }
 
-    pub fn key_count(&self) -> usize {
-        self.entries.len()
+    pub fn sismember(&self, key: &[u8], member: &[u8]) -> Result<bool, String> {
+        let shard = self.get_shard(key).read();
+        if shard.is_expired(key) {
+            return Err("key does not exist".into());
+        }
+        match shard.data.get(key) {
+            Some(StorageValue::Set(set)) => Ok(set.contains(member)),
+            Some(_) => Err("wrong type for key".into()),
+            None => Ok(false),
+        }
+    }
+
+    pub fn smembers(&self, key: &[u8]) -> Result<HashSet<Vec<u8>>, String> {
+        let shard = self.get_shard(key).read();
+        if shard.is_expired(key) {
+            return Err("key does not exist".into());
+        }
+        match shard.data.get(key) {
+            Some(StorageValue::Set(set)) => Ok(set.clone()),
+            Some(_) => Err("wrong type for key".into()),
+            None => Ok(HashSet::new()),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Sorted set operations
+    // -----------------------------------------------------------------------
+
+    pub fn zadd(&self, key: &[u8], score: i64, member: Vec<u8>) -> Result<bool, String> {
+        let shard_lock = self.get_shard(key);
+        let mut shard = shard_lock.write();
+
+        if shard.is_expired(key) {
+            return Err("key does not exist".into());
+        }
+
+        match shard.data.get_mut(key) {
+            Some(StorageValue::SortedSet(set)) => {
+                let old_len = set.len();
+                let to_remove: Vec<(i64, Vec<u8>)> = set
+                    .iter()
+                    .filter(|(_, m)| *m == member)
+                    .cloned()
+                    .collect();
+                for entry in &to_remove {
+                    set.remove(entry);
+                }
+                let existed = set.len() < old_len;
+                set.insert((score, member));
+                let new_len = set.len();
+                let diff = (new_len as isize) - (old_len as isize);
+                drop(shard);
+                if diff > 0 {
+                    self.current_memory.fetch_add(
+                        diff as usize * std::mem::size_of::<(i64, Vec<u8>)>(),
+                        Ordering::Relaxed,
+                    );
+                }
+                Ok(!existed)
+            }
+            Some(_) => Err("wrong type for key".into()),
+            None => {
+                let mut set = BTreeSet::new();
+                set.insert((score, member));
+                let val = StorageValue::SortedSet(set);
+                let mem = val.memory_usage();
+                shard.insert(key.to_vec(), val);
+                drop(shard);
+                self.current_memory
+                    .fetch_add(mem, Ordering::Relaxed);
+                self.evict_if_needed();
+                Ok(true)
+            }
+        }
+    }
+
+    pub fn zscore(&self, key: &[u8], member: &[u8]) -> Result<Option<i64>, String> {
+        let shard = self.get_shard(key).read();
+        if shard.is_expired(key) {
+            return Err("key does not exist".into());
+        }
+        match shard.data.get(key) {
+            Some(StorageValue::SortedSet(set)) => {
+                Ok(set.iter().find(|(_, m)| m == member).map(|(s, _)| *s))
+            }
+            Some(_) => Err("wrong type for key".into()),
+            None => Ok(None),
+        }
+    }
+
+    pub fn zrange(
+        &self,
+        key: &[u8],
+        start: usize,
+        stop: usize,
+    ) -> Result<Vec<(i64, Vec<u8>)>, String> {
+        let shard = self.get_shard(key).read();
+        if shard.is_expired(key) {
+            return Err("key does not exist".into());
+        }
+        match shard.data.get(key) {
+            Some(StorageValue::SortedSet(set)) => {
+                let items: Vec<(i64, Vec<u8>)> = set.iter().cloned().collect();
+                if items.is_empty() || start >= items.len() {
+                    return Ok(Vec::new());
+                }
+                let end = stop.min(items.len() - 1);
+                if start > end {
+                    return Ok(Vec::new());
+                }
+                Ok(items[start..=end].to_vec())
+            }
+            Some(_) => Err("wrong type for key".into()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Stream operations
+    // -----------------------------------------------------------------------
+
+    pub fn xadd(&self, key: &[u8], fields: HashMap<Vec<u8>, Vec<u8>>) -> Result<u64, String> {
+        let shard_lock = self.get_shard(key);
+        let mut shard = shard_lock.write();
+
+        if shard.is_expired(key) {
+            return Err("key does not exist".into());
+        }
+
+        match shard.data.get_mut(key) {
+            Some(StorageValue::Stream(stream)) => {
+                stream.last_entry_id += 1;
+                let id = stream.last_entry_id;
+                stream.entries.push(StreamEntry { id, fields });
+                Ok(id)
+            }
+            Some(_) => Err("wrong type for key".into()),
+            None => {
+                let mut stream = StreamData::default();
+                stream.last_entry_id = 1;
+                stream.entries.push(StreamEntry { id: 1, fields });
+                let val = StorageValue::Stream(stream);
+                let mem = val.memory_usage();
+                shard.insert(key.to_vec(), val);
+                drop(shard);
+                self.current_memory
+                    .fetch_add(mem, Ordering::Relaxed);
+                self.evict_if_needed();
+                Ok(1)
+            }
+        }
+    }
+
+    pub fn xrange(
+        &self,
+        key: &[u8],
+        start_id: u64,
+        end_id: u64,
+    ) -> Result<Vec<StreamEntry>, String> {
+        let shard = self.get_shard(key).read();
+        if shard.is_expired(key) {
+            return Err("key does not exist".into());
+        }
+        match shard.data.get(key) {
+            Some(StorageValue::Stream(stream)) => Ok(stream
+                .entries
+                .iter()
+                .filter(|e| e.id >= start_id && e.id <= end_id)
+                .cloned()
+                .collect()),
+            Some(_) => Err("wrong type for key".into()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Random key sampling
+    // -----------------------------------------------------------------------
+
+    pub fn random_key(&self) -> Option<Vec<u8>> {
+        let mut rng = rand::thread_rng();
+        let mut attempts = 0;
+        loop {
+            if attempts > self.num_shards * 3 {
+                return None;
+            }
+            let idx = rng.gen_range(0..self.num_shards);
+            let shard = self.shards[idx].read();
+            let keys: Vec<&Vec<u8>> = shard
+                .data
+                .keys()
+                .filter(|k| !shard.is_expired(k))
+                .collect();
+            if !keys.is_empty() {
+                let chosen = keys[rng.gen_range(0..keys.len())];
+                return Some(chosen.clone());
+            }
+            drop(shard);
+            attempts += 1;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Cleanup / maintenance
+    // -----------------------------------------------------------------------
+
+    pub fn cleanup_expired(&self) -> usize {
+        let mut total_cleaned = 0usize;
+        for shard_lock in &self.shards {
+            let mut shard = shard_lock.write();
+            let expired = shard.cleanup_expired();
+            total_cleaned += expired.len();
+        }
+        total_cleaned
+    }
+
+    /// Spawn a background Tokio task that periodically cleans up expired keys.
+    pub fn start_cleanup_task(self: &Arc<Self>) {
+        let engine = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
+            loop {
+                interval.tick().await;
+                engine.cleanup_expired();
+            }
+        });
+    }
+
+    /// Total number of keys across all shards.
+    pub fn dbsize(&self) -> usize {
+        self.shards.iter().map(|s| s.read().data.len()).sum()
+    }
+
+    /// Current memory usage in bytes.
+    pub fn memory_usage(&self) -> usize {
+        self.current_memory.load(Ordering::Relaxed)
+    }
+
+    /// Set maximum memory limit.
+    pub fn set_max_memory(&self, max: usize) {
+        self.max_memory.store(max, Ordering::Relaxed);
+        self.evict_if_needed();
+    }
+
+    /// Set eviction policy.
+    pub fn set_eviction_policy(&self, policy: EvictionPolicy) {
+        *self.eviction_policy.write() = policy;
+    }
+
+    /// Flush all keys.
+    pub fn flush_all(&self) {
+        for shard_lock in &self.shards {
+            let mut shard = shard_lock.write();
+            shard.data.clear();
+            shard.ttl.clear();
+            shard.access_info.clear();
+            shard.size_bytes = 0;
+        }
+        self.current_memory.store(0, Ordering::Relaxed);
+    }
+}
+
+impl Default for StorageEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn engine() -> StorageEngine {
+        StorageEngine::with_config(16, 1024 * 1024, EvictionPolicy::Lru)
+    }
+
+    #[test]
+    fn test_set_get_del() {
+        let e = engine();
+        let key = b"foo".to_vec();
+        let val = StorageValue::String(b"bar".to_vec());
+
+        e.set(key.clone(), val.clone());
+        assert_eq!(e.get(&key), Some(val.clone()));
+        assert!(e.exists(&key));
+
+        assert!(e.del(&key));
+        assert_eq!(e.get(&key), None);
+        assert!(!e.exists(&key));
+        assert!(!e.del(&key));
+    }
+
+    #[test]
+    fn test_mget_mset() {
+        let e = engine();
+        let pairs: Vec<(Vec<u8>, StorageValue)> = vec![
+            (b"a".to_vec(), StorageValue::String(b"1".to_vec())),
+            (b"b".to_vec(), StorageValue::String(b"2".to_vec())),
+            (b"c".to_vec(), StorageValue::String(b"3".to_vec())),
+        ];
+        e.mset(pairs);
+
+        let keys: Vec<Vec<u8>> = vec![
+            b"a".to_vec(),
+            b"b".to_vec(),
+            b"c".to_vec(),
+            b"d".to_vec(),
+        ];
+        let results = e.mget(&keys);
+        assert_eq!(results[0], Some(StorageValue::String(b"1".to_vec())));
+        assert_eq!(results[1], Some(StorageValue::String(b"2".to_vec())));
+        assert_eq!(results[2], Some(StorageValue::String(b"3".to_vec())));
+        assert_eq!(results[3], None);
+    }
+
+    #[test]
+    fn test_incr_decr() {
+        let e = engine();
+        let key = b"counter".to_vec();
+        e.set(key.clone(), StorageValue::String(b"10".to_vec()));
+
+        assert_eq!(e.incr(&key, 5).unwrap(), 15);
+        assert_eq!(e.decr(&key, 3).unwrap(), 12);
+        assert_eq!(e.incr(&key, -2).unwrap(), 10);
+        assert_eq!(e.decr(&key, -10).unwrap(), 20);
+
+        e.set(
+            key.clone(),
+            StorageValue::String(i64::MAX.to_string().into_bytes()),
+        );
+        assert!(e.incr(&key, 1).is_err());
+    }
+
+    #[test]
+    fn test_ttl_expire_persist() {
+        let e = engine();
+        let key = b"ttl_key".to_vec();
+        e.set(key.clone(), StorageValue::String(b"v".to_vec()));
+
+        assert!(e.ttl(&key).is_none());
+        assert!(e.expire(&key, Duration::from_secs(10)));
+        assert!(e.ttl(&key).is_some());
+        let remaining = e.ttl(&key).unwrap();
+        assert!(remaining <= Duration::from_secs(10));
+        assert!(remaining > Duration::from_secs(0));
+
+        assert!(e.persist(&key));
+        assert!(e.ttl(&key).is_none());
+
+        assert!(!e.expire(b"noexist", Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn test_lazy_expiry() {
+        let e = engine();
+        let key = b"short".to_vec();
+        e.set(key.clone(), StorageValue::String(b"v".to_vec()));
+        e.expire(&key, Duration::from_millis(1));
+
+        assert!(e.get(&key).is_some());
+
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(e.get(&key).is_none());
+    }
+
+    #[test]
+    fn test_cleanup_expired() {
+        let e = engine();
+        for i in 0..10 {
+            let key = format!("k{}", i).into_bytes();
+            e.set(key.clone(), StorageValue::String(b"v".to_vec()));
+            e.expire(&key, Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        let cleaned = e.cleanup_expired();
+        assert_eq!(cleaned, 10);
+        assert_eq!(e.dbsize(), 0);
+    }
+
+    #[test]
+    fn test_append() {
+        let e = engine();
+        let key = b"app".to_vec();
+        e.set(key.clone(), StorageValue::String(b"hello".to_vec()));
+
+        let new_len = e.append(&key, b" world").unwrap();
+        assert_eq!(new_len, 11);
+        assert_eq!(
+            e.get(&key),
+            Some(StorageValue::String(b"hello world".to_vec()))
+        );
+    }
+
+    #[test]
+    fn test_strlen() {
+        let e = engine();
+        let key = b"len".to_vec();
+        e.set(key.clone(), StorageValue::String(b"hello".to_vec()));
+        assert_eq!(e.strlen(&key).unwrap(), 5);
+
+        assert!(e.strlen(b"noexist").is_err());
+    }
+
+    #[test]
+    fn test_getrange_setrange() {
+        let e = engine();
+        let key = b"range".to_vec();
+        e.set(
+            key.clone(),
+            StorageValue::String(b"Hello, World!".to_vec()),
+        );
+
+        assert_eq!(e.getrange(&key, 0, 4).unwrap(), b"Hello");
+        assert_eq!(e.getrange(&key, -6, -2).unwrap(), b"World");
+        assert_eq!(e.getrange(&key, 20, 25).unwrap(), b"");
+
+        e.setrange(&key, 7, b"Rust").unwrap();
+        assert_eq!(
+            e.get(&key),
+            Some(StorageValue::String(b"Hello, Rustd!".to_vec()))
+        );
+    }
+
+    #[test]
+    fn test_type_command() {
+        let e = engine();
+        e.set(b"s".to_vec(), StorageValue::String(b"".to_vec()));
+        e.lpush(b"l", vec![b"1".to_vec()]).unwrap();
+        e.hset(b"h", b"f".to_vec(), b"v".to_vec())
+            .unwrap();
+        e.sadd(b"se", vec![b"m".to_vec()]).unwrap();
+        e.zadd(b"z", 1, b"m".to_vec()).unwrap();
+
+        assert_eq!(e.r#type(b"s"), Some(DataType::String));
+        assert_eq!(e.r#type(b"l"), Some(DataType::List));
+        assert_eq!(e.r#type(b"h"), Some(DataType::Hash));
+        assert_eq!(e.r#type(b"se"), Some(DataType::Set));
+        assert_eq!(e.r#type(b"z"), Some(DataType::SortedSet));
+        assert_eq!(e.r#type(b"missing"), None);
+    }
+
+    #[test]
+    fn test_list_ops() {
+        let e = engine();
+        let key = b"mylist".to_vec();
+
+        let len = e
+            .rpush(&key, vec![b"a".to_vec(), b"b".to_vec()])
+            .unwrap();
+        assert_eq!(len, 2);
+        let len = e.lpush(&key, vec![b"c".to_vec()]).unwrap();
+        assert_eq!(len, 3);
+
+        assert_eq!(
+            e.lrange(&key, 0, -1).unwrap(),
+            vec![b"c".to_vec(), b"a".to_vec(), b"b".to_vec()]
+        );
+        assert_eq!(e.lindex(&key, 0).unwrap(), Some(b"c".to_vec()));
+        assert_eq!(e.lindex(&key, -1).unwrap(), Some(b"b".to_vec()));
+
+        assert_eq!(e.lpop(&key).unwrap(), Some(b"c".to_vec()));
+        assert_eq!(e.rpop(&key).unwrap(), Some(b"b".to_vec()));
+
+        e.lset(&key, 0, b"z".to_vec()).unwrap();
+        assert_eq!(e.lindex(&key, 0).unwrap(), Some(b"z".to_vec()));
+    }
+
+    #[test]
+    fn test_hash_ops() {
+        let e = engine();
+        let key = b"myhash".to_vec();
+
+        assert!(e
+            .hset(&key, b"f1".to_vec(), b"v1".to_vec())
+            .unwrap());
+        assert!(!e
+            .hset(&key, b"f1".to_vec(), b"v2".to_vec())
+            .unwrap());
+        assert_eq!(
+            e.hget(&key, b"f1").unwrap(),
+            Some(b"v2".to_vec())
+        );
+
+        assert!(e.hdel(&key, b"f1").unwrap());
+        assert!(!e.hdel(&key, b"f1").unwrap());
+
+        e.hset(&key, b"a".to_vec(), b"1".to_vec()).unwrap();
+        e.hset(&key, b"b".to_vec(), b"2".to_vec()).unwrap();
+        let all = e.hgetall(&key).unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn test_set_ops() {
+        let e = engine();
+        let key = b"myset".to_vec();
+
+        let added = e
+            .sadd(&key, vec![b"a".to_vec(), b"b".to_vec(), b"a".to_vec()])
+            .unwrap();
+        assert_eq!(added, 2);
+
+        assert!(e.sismember(&key, b"a").unwrap());
+        assert!(!e.sismember(&key, b"z").unwrap());
+
+        let members = e.smembers(&key).unwrap();
+        assert_eq!(members.len(), 2);
+    }
+
+    #[test]
+    fn test_sorted_set_ops() {
+        let e = engine();
+        let key = b"myzset".to_vec();
+
+        e.zadd(&key, 10, b"alice".to_vec()).unwrap();
+        e.zadd(&key, 5, b"bob".to_vec()).unwrap();
+        e.zadd(&key, 20, b"charlie".to_vec()).unwrap();
+
+        assert_eq!(e.zscore(&key, b"bob").unwrap(), Some(5));
+        assert_eq!(e.zscore(&key, b"alice").unwrap(), Some(10));
+        assert_eq!(e.zscore(&key, b"nobody").unwrap(), None);
+
+        let range = e.zrange(&key, 0, 1).unwrap();
+        assert_eq!(range.len(), 2);
+        assert_eq!(range[0].0, 5);
+        assert_eq!(range[1].0, 10);
+
+        e.zadd(&key, 100, b"bob".to_vec()).unwrap();
+        assert_eq!(e.zscore(&key, b"bob").unwrap(), Some(100));
+    }
+
+    #[test]
+    fn test_stream_ops() {
+        let e = engine();
+        let key = b"mystream".to_vec();
+        let mut fields = HashMap::new();
+        fields.insert(b"field1".to_vec(), b"val1".to_vec());
+
+        let id1 = e.xadd(&key, fields.clone()).unwrap();
+        assert_eq!(id1, 1);
+
+        fields.insert(b"field2".to_vec(), b"val2".to_vec());
+        let id2 = e.xadd(&key, fields).unwrap();
+        assert_eq!(id2, 2);
+
+        let entries = e.xrange(&key, 1, 2).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, 1);
+        assert_eq!(entries[1].id, 2);
+    }
+
+    #[test]
+    fn test_wrong_type_errors() {
+        let e = engine();
+        e.set(b"str".to_vec(), StorageValue::String(b"val".to_vec()));
+
+        assert!(e.incr(b"str", 1).is_err());
+        assert!(e.lrange(b"str", 0, -1).is_err());
+        assert!(e.hget(b"str", b"f").is_err());
+        assert!(e.sismember(b"str", b"m").is_err());
+        assert!(e.zscore(b"str", b"m").is_err());
+        assert!(e.xadd(b"str", HashMap::new()).is_err());
+    }
+
+    #[test]
+    fn test_eviction() {
+        let e = StorageEngine::with_config(4, 200, EvictionPolicy::Lru);
+
+        for i in 0..50 {
+            let key = format!("key_{}", i).into_bytes();
+            let val = StorageValue::String(vec![b'x'; 50]);
+            e.set(key, val);
+        }
+
+        assert!(e.memory_usage() < 200);
+    }
+
+    #[test]
+    fn test_random_key() {
+        let e = engine();
+        e.set(b"k1".to_vec(), StorageValue::String(b"v".to_vec()));
+        e.set(b"k2".to_vec(), StorageValue::String(b"v".to_vec()));
+
+        let key = e.random_key();
+        assert!(key.is_some());
+        let k = key.unwrap();
+        assert!(k == b"k1" || k == b"k2");
+    }
+
+    #[test]
+    fn test_flush_all() {
+        let e = engine();
+        e.set(b"a".to_vec(), StorageValue::String(b"1".to_vec()));
+        e.set(b"b".to_vec(), StorageValue::String(b"2".to_vec()));
+        assert_eq!(e.dbsize(), 2);
+
+        e.flush_all();
+        assert_eq!(e.dbsize(), 0);
+        assert_eq!(e.memory_usage(), 0);
+    }
+
+    #[test]
+    fn test_set_with_ttl() {
+        let e = engine();
+        let key = b"ttlset".to_vec();
+        e.set_with_ttl(
+            key.clone(),
+            StorageValue::String(b"v".to_vec()),
+            Duration::from_secs(60),
+        );
+
+        assert!(e.ttl(&key).is_some());
+        let remaining = e.ttl(&key).unwrap();
+        assert!(remaining <= Duration::from_secs(60));
+        assert!(remaining > Duration::from_secs(50));
+    }
+
+    #[test]
+    fn test_overwrite_key() {
+        let e = engine();
+        let key = b"ow".to_vec();
+        e.set(key.clone(), StorageValue::String(b"first".to_vec()));
+        assert_eq!(
+            e.get(&key),
+            Some(StorageValue::String(b"first".to_vec()))
+        );
+
+        e.set(key.clone(), StorageValue::String(b"second".to_vec()));
+        assert_eq!(
+            e.get(&key),
+            Some(StorageValue::String(b"second".to_vec()))
+        );
+    }
+
+    #[test]
+    fn test_dbsize_memory() {
+        let e = engine();
+        assert_eq!(e.dbsize(), 0);
+        assert_eq!(e.memory_usage(), 0);
+
+        e.set(b"a".to_vec(), StorageValue::String(b"hello".to_vec()));
+        e.set(b"b".to_vec(), StorageValue::String(b"world".to_vec()));
+        assert_eq!(e.dbsize(), 2);
+        assert!(e.memory_usage() > 0);
     }
 }

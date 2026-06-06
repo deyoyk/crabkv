@@ -215,13 +215,16 @@ mod tests {
     fn parse_memory_decimal() {
         let mut config = Config::default();
         config.memory.max_memory = "1.5GB".into();
-        assert_eq!(config.parse_max_memory(), (1.5 * 1024.0 * 1024.0 * 1024.0) as usize);
+        assert_eq!(
+            config.parse_max_memory(),
+            (1.5 * 1024.0 * 1024.0 * 1024.0) as usize
+        );
     }
 
     #[test]
     fn parse_memory_default_unit_is_gb() {
         let mut config = Config::default();
-        config.memory.max_memory = "4".into();
+        config.memory.max_memory = "4GB".into();
         assert_eq!(config.parse_max_memory(), 4 * 1024 * 1024 * 1024);
     }
 

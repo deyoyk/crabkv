@@ -324,18 +324,21 @@ mod tests {
         let jq = JobQueue::new();
         let id = jq.add_job("q", b"data".to_vec(), 0, None);
 
-        for _ in 0..3 {
-            jq.pop_job("q");
-        }
+        // Pop the job, it's now running
+        let job = jq.pop_job("q").unwrap();
+        assert_eq!(job.id, id);
 
-        let mut found_dead = false;
-        for _ in 0..3 {
-            if jq.pop_job("q").is_some() {
-                found_dead = true;
-            }
-        }
-        assert!(found_dead);
+        // Fail it (attempts=1, max=3) -> retries
+        jq.fail_job("q", &id, "error1");
+        let job = jq.pop_job("q").unwrap();
+        assert_eq!(job.attempts, 2);
 
+        // Fail again -> retries
+        jq.fail_job("q", &id, "error2");
+        let job = jq.pop_job("q").unwrap();
+        assert_eq!(job.attempts, 3);
+
+        // Fail again -> dead letter (max attempts reached)
         jq.fail_job("q", &id, "exhausted");
         let letters = jq.get_dead_letters("q");
         assert_eq!(letters.len(), 1);

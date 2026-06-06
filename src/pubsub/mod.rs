@@ -297,7 +297,7 @@ mod tests {
 
         b.publish(b"a", b"for_a");
         assert_eq!(rx_a.try_recv().unwrap(), b"for_a".to_vec());
-        assert!(matches!(rx_b.try_recv(), Err(RecvError::Empty)));
+        assert!(matches!(rx_b.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
     }
 
     #[test]
@@ -327,9 +327,9 @@ mod tests {
     fn subscriber_count() {
         let b = PubSubBroadcaster::new();
         assert_eq!(b.subscriber_count(b"t"), 0);
-        let _ = b.subscribe(b"t");
+        let _rx1 = b.subscribe(b"t");
         assert_eq!(b.subscriber_count(b"t"), 1);
-        let _ = b.subscribe(b"t");
+        let _rx2 = b.subscribe(b"t");
         assert_eq!(b.subscriber_count(b"t"), 2);
     }
 
@@ -352,7 +352,7 @@ mod tests {
         assert_eq!(total, 2);
         assert_eq!(rx1.try_recv().unwrap(), b"data".to_vec());
         assert_eq!(rx2.try_recv().unwrap(), b"data".to_vec());
-        assert!(matches!(rx3.try_recv(), Err(RecvError::Empty)));
+        assert!(matches!(rx3.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
     }
 
     #[test]
