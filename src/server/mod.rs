@@ -1925,7 +1925,7 @@ fn find_crlf(buf: &[u8]) -> Option<usize> {
     }
 }
 
-const MAX_RESP_ARGS: usize = 512;
+const MAX_RESP_ARGS: usize = 4096;
 
 struct ZeroCopyArgs<'a> {
     buf: Vec<&'a [u8]>,
