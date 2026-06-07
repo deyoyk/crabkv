@@ -172,7 +172,7 @@ impl Server {
                 accept_result = listener.accept() => {
                     match accept_result {
                         Ok((stream, peer_addr)) => {
-                            tracing::debug!("New connection from {}", peer_addr);
+                            tracing::trace!("New connection from {}", peer_addr);
                             active.fetch_add(1, Ordering::Relaxed);
 
                             let sub_broadcaster = broadcaster.clone();
@@ -247,7 +247,7 @@ impl Server {
                 };
                 match stream.get_mut().read(write_slice).await {
                     Ok(0) => {
-                        tracing::debug!(client_id = ctx.client_id, "Client disconnected");
+                        tracing::trace!(client_id = ctx.client_id, "Client disconnected");
                         break;
                     }
                     Ok(n) => {
@@ -297,13 +297,13 @@ impl Server {
                 } else {
                     // Zero-copy RESP parsing
                     match try_parse_resp_frame_zero_copy(available) {
-                        Some((consumed, arg_slices)) => {
+                        Some((consumed, args)) => {
                             read_pos += consumed;
-                            if arg_slices.is_empty() {
+                            if args.is_empty() {
                                 continue;
                             }
                             // Ultra-fast: write response directly to buffer
-                            Self::write_command_response(&arg_slices, &ctx, &mut resp_buf);
+                            Self::write_command_response(args.as_slice(), &ctx, &mut resp_buf);
                             // Check if we need to close
                             if resp_buf.ends_with(b"__CLOSE__\r\n") {
                                 resp_buf.truncate(resp_buf.len() - 11);
@@ -1425,382 +1425,6 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
 
     /// Zero-copy command processor - works directly with byte slices from the read buffer.
     /// This eliminates all String allocations in the hot path.
-    async fn process_command_zerocopy<'a>(args: &[&'a [u8]], ctx: &ServerContext) -> String {
-        if args.is_empty() {
-            return "-ERR empty command\r\n".into();
-        }
-
-        let cmd = args[0];
-
-        // Ultra-hot path: single byte dispatch for the most common commands
-        match cmd.len() {
-            3 => {
-                if cmd.eq_ignore_ascii_case(b"SET") {
-                    if args.len() < 3 {
-                        return "-ERR wrong number of arguments for 'SET' command\r\n".into();
-                    }
-                    let key = args[1];
-                    let val = args[2];
-                    let mut ttl = None;
-                    let mut i = 3;
-                    while i < args.len() {
-                        if args[i].eq_ignore_ascii_case(b"EX") {
-                            if let Some(secs) = args.get(i + 1).and_then(|s| std::str::from_utf8(s).ok()?.parse::<u64>().ok()) {
-                                ttl = Some(std::time::Duration::from_secs(secs));
-                            }
-                            i += 2;
-                        } else if args[i].eq_ignore_ascii_case(b"PX") {
-                            if let Some(ms) = args.get(i + 1).and_then(|s| std::str::from_utf8(s).ok()?.parse::<u64>().ok()) {
-                                ttl = Some(std::time::Duration::from_millis(ms));
-                            }
-                            i += 2;
-                        } else {
-                            i += 1;
-                        }
-                    }
-                    ctx.storage.set(key.to_vec(), StorageValue::String(val.to_vec()));
-                    if let Some(t) = ttl {
-                        ctx.storage.expire(key, t);
-                    }
-                    return "+OK\r\n".into();
-                }
-                if cmd.eq_ignore_ascii_case(b"GET") {
-                    if args.len() < 2 {
-                        return "-ERR wrong number of arguments for 'GET' command\r\n".into();
-                    }
-                    let key = args[1];
-                    return match ctx.storage.get(key) {
-                        Some(StorageValue::String(s)) => {
-                            let mut resp = String::with_capacity(32 + s.len());
-                            resp.push_str(&format!("${}\r\n", s.len()));
-                            // Write value bytes directly
-                            resp.push_str(&String::from_utf8_lossy(&s));
-                            resp.push_str("\r\n");
-                            resp
-                        }
-                        Some(_) => "-ERR WRONGTYPE Operation against a key\r\n".into(),
-                        None => "$-1\r\n".into(),
-                    };
-                }
-                if cmd.eq_ignore_ascii_case(b"DEL") {
-                    if args.len() < 2 {
-                        return "-ERR wrong number of arguments for 'DEL' command\r\n".into();
-                    }
-                    let mut count = 0u64;
-                    for key in &args[1..] {
-                        if ctx.storage.del(key) {
-                            count += 1;
-                        }
-                    }
-                    return format!(":{}\r\n", count);
-                }
-                if cmd.eq_ignore_ascii_case(b"PNG") || cmd.eq_ignore_ascii_case(b"pin") {
-                    // Skip - not a real command
-                }
-            }
-            4 => {
-                if cmd.eq_ignore_ascii_case(b"PING") {
-                    return if args.len() > 1 {
-                        let mut resp = String::with_capacity(4 + args[1].len() + 2);
-                        resp.push('+');
-                        resp.push_str(&String::from_utf8_lossy(args[1]));
-                        resp.push_str("\r\n");
-                        resp
-                    } else {
-                        "+PONG\r\n".into()
-                    };
-                }
-                if cmd.eq_ignore_ascii_case(b"ECHO") {
-                    if args.len() < 2 {
-                        return "-ERR wrong number of arguments for 'ECHO' command\r\n".into();
-                    }
-                    let mut resp = String::with_capacity(16 + args[1].len());
-                    resp.push_str(&format!("${}\r\n", args[1].len()));
-                    resp.push_str(&String::from_utf8_lossy(args[1]));
-                    resp.push_str("\r\n");
-                    return resp;
-                }
-                if cmd.eq_ignore_ascii_case(b"QUIT") {
-                    return "__CLOSE__".into();
-                }
-                if cmd.eq_ignore_ascii_case(b"INCR") || cmd.eq_ignore_ascii_case(b"DECR") {
-                    if args.len() < 2 {
-                        return "-ERR wrong number of arguments\r\n".into();
-                    }
-                    let amount = if cmd.eq_ignore_ascii_case(b"INCR") { 1 } else { -1 };
-                    let result = ctx.storage.incr(args[1], amount);
-                    return match result {
-                        Ok(n) => format!(":{}\r\n", n),
-                        Err(e) => format!("-ERR {}\r\n", e),
-                    };
-                }
-            }
-            5 => {
-                if cmd.eq_ignore_ascii_case(b"EXISTS") {
-                    if args.len() < 2 {
-                        return "-ERR wrong number of arguments for 'EXISTS' command\r\n".into();
-                    }
-                    let mut count = 0u64;
-                    for key in &args[1..] {
-                        if ctx.storage.exists(key) {
-                            count += 1;
-                        }
-                    }
-                    return format!(":{}\r\n", count);
-                }
-            }
-            6 => {
-                if cmd.eq_ignore_ascii_case(b"DBSIZE") {
-                    return format!(":{}\r\n", ctx.storage.dbsize());
-                }
-                if cmd.eq_ignore_ascii_case(b"INCRBY") || cmd.eq_ignore_ascii_case(b"DECRBY") {
-                    if args.len() < 3 {
-                        return "-ERR wrong number of arguments\r\n".into();
-                    }
-                    let amount: i64 = std::str::from_utf8(args[2])
-                        .map(|s| s.parse().unwrap_or(0))
-                        .unwrap_or(0);
-                    let amount = if cmd.eq_ignore_ascii_case(b"INCRBY") { amount } else { -amount };
-                    let result = ctx.storage.incr(args[1], amount);
-                    return match result {
-                        Ok(n) => format!(":{}\r\n", n),
-                        Err(e) => format!("-ERR {}\r\n", e),
-                    };
-                }
-            }
-            7 => {
-                if cmd.eq_ignore_ascii_case(b"LPUSH") || cmd.eq_ignore_ascii_case(b"RPUSH") {
-                    if args.len() < 3 {
-                        return "-ERR wrong number of arguments\r\n".into();
-                    }
-                    let vals: Vec<Vec<u8>> = args[2..].iter().map(|a| a.to_vec()).collect();
-                    let result = if cmd.eq_ignore_ascii_case(b"LPUSH") {
-                        ctx.storage.lpush(args[1], vals)
-                    } else {
-                        ctx.storage.rpush(args[1], vals)
-                    };
-                    return match result {
-                        Ok(n) => format!(":{}\r\n", n),
-                        Err(e) => format!("-ERR {}\r\n", e),
-                    };
-                }
-                if cmd.eq_ignore_ascii_case(b"FLUSHALL") || cmd.eq_ignore_ascii_case(b"FLUSHDB") {
-                    ctx.storage.flush_all();
-                    return "+OK\r\n".into();
-                }
-            }
-            8 => {
-                if cmd.eq_ignore_ascii_case(b"LPOP") || cmd.eq_ignore_ascii_case(b"RPOP") {
-                    if args.len() < 2 {
-                        return "-ERR wrong number of arguments\r\n".into();
-                    }
-                    let result = if cmd.eq_ignore_ascii_case(b"LPOP") {
-                        ctx.storage.lpop(args[1])
-                    } else {
-                        ctx.storage.rpop(args[1])
-                    };
-                    return match result {
-                        Ok(Some(v)) => {
-                            let mut resp = String::with_capacity(32 + v.len());
-                            resp.push_str(&format!("${}\r\n", v.len()));
-                            resp.push_str(&String::from_utf8_lossy(&v));
-                            resp.push_str("\r\n");
-                            resp
-                        }
-                        Ok(None) => "$-1\r\n".into(),
-                        Err(e) => format!("-ERR {}\r\n", e),
-                    };
-                }
-                if cmd.eq_ignore_ascii_case(b"PUBLISH") {
-                    if args.len() < 3 {
-                        return "-ERR wrong number of arguments for 'PUBLISH' command\r\n".into();
-                    }
-                    let count = ctx.broadcaster.publish(args[1], args[2]);
-                    return format!(":{}\r\n", count);
-                }
-            }
-            9 => {
-                if cmd.eq_ignore_ascii_case(b"HSET") || cmd.eq_ignore_ascii_case(b"HGET") {
-                    if cmd.eq_ignore_ascii_case(b"HSET") {
-                        if args.len() < 4 {
-                            return "-ERR wrong number of arguments for 'HSET' command\r\n".into();
-                        }
-                        let result = ctx.storage.hset(args[1], args[2].to_vec(), args[3].to_vec());
-                        return match result {
-                            Ok(_) => ":1\r\n".into(),
-                            Err(e) => format!("-ERR {}\r\n", e),
-                        };
-                    } else {
-                        if args.len() < 3 {
-                            return "-ERR wrong number of arguments for 'HGET' command\r\n".into();
-                        }
-                        let result = ctx.storage.hget(args[1], args[2]);
-                        return match result {
-                            Ok(Some(v)) => {
-                                let mut resp = String::with_capacity(32 + v.len());
-                                resp.push_str(&format!("${}\r\n", v.len()));
-                                resp.push_str(&String::from_utf8_lossy(&v));
-                                resp.push_str("\r\n");
-                                resp
-                            }
-                            Ok(None) => "$-1\r\n".into(),
-                            Err(e) => format!("-ERR {}\r\n", e),
-                        };
-                    }
-                }
-                if cmd.eq_ignore_ascii_case(b"SADD") {
-                    if args.len() < 3 {
-                        return "-ERR wrong number of arguments for 'SADD' command\r\n".into();
-                    }
-                    let members: Vec<Vec<u8>> = args[2..].iter().map(|a| a.to_vec()).collect();
-                    let result = ctx.storage.sadd(args[1], members);
-                    return match result {
-                        Ok(n) => format!(":{}\r\n", n),
-                        Err(e) => format!("-ERR {}\r\n", e),
-                    };
-                }
-                if cmd.eq_ignore_ascii_case(b"LRANGE") {
-                    if args.len() < 4 {
-                        return "-ERR wrong number of arguments for 'LRANGE' command\r\n".into();
-                    }
-                    let start = std::str::from_utf8(args[2]).unwrap_or("0").parse::<i64>().unwrap_or(0);
-                    let stop = std::str::from_utf8(args[3]).unwrap_or("-1").parse::<i64>().unwrap_or(-1);
-                    return match ctx.storage.lrange(args[1], start, stop) {
-                        Ok(items) => {
-                            let mut resp = format!("*{}\r\n", items.len());
-                            for item in &items {
-                                resp.push_str(&format!("${}\r\n", item.len()));
-                                resp.push_str(&String::from_utf8_lossy(item));
-                                resp.push_str("\r\n");
-                            }
-                            resp
-                        }
-                        Err(e) => format!("-ERR {}\r\n", e),
-                    };
-                }
-            }
-            10 => {
-                if cmd.eq_ignore_ascii_case(b"SUBSCRIBE") {
-                    if args.len() < 2 {
-                        return "-ERR wrong number of arguments for 'SUBSCRIBE' command\r\n".into();
-                    }
-                    let mut response = String::new();
-                    for channel in &args[1..] {
-                        let rx = ctx.broadcaster.subscribe_client(ctx.client_id, channel);
-                        {
-                            let mut subs = ctx.subscribed_channels.write();
-                            subs.push(channel.to_vec());
-                        }
-                        {
-                            let mut receivers = ctx.pubsub_receivers.write();
-                            receivers.push(rx);
-                        }
-                        let ch_str = String::from_utf8_lossy(channel);
-                        response.push_str(&format!(
-                            "*3\r\n$9\r\nsubscribe\r\n${}\r\n{}\r\n:1\r\n",
-                            channel.len(),
-                            ch_str
-                        ));
-                    }
-                    return response;
-                }
-                if cmd.eq_ignore_ascii_case(b"HGETALL") {
-                    if args.len() < 2 {
-                        return "-ERR wrong number of arguments for 'HGETALL' command\r\n".into();
-                    }
-                    let result = ctx.storage.hgetall(args[1]);
-                    return match result {
-                        Ok(pairs) => {
-                            let mut resp = format!("*{}\r\n", pairs.len() * 2);
-                            for (k, v) in &pairs {
-                                resp.push_str(&format!("${}\r\n", k.len()));
-                                resp.push_str(&String::from_utf8_lossy(k));
-                                resp.push_str("\r\n");
-                                resp.push_str(&format!("${}\r\n", v.len()));
-                                resp.push_str(&String::from_utf8_lossy(v));
-                                resp.push_str("\r\n");
-                            }
-                            resp
-                        }
-                        Err(e) => format!("-ERR {}\r\n", e),
-                    };
-                }
-            }
-            11 => {
-                if cmd.eq_ignore_ascii_case(b"PSUBSCRIBE") {
-                    if args.len() < 2 {
-                        return "-ERR wrong number of arguments for 'PSUBSCRIBE' command\r\n".into();
-                    }
-                    let mut response = String::new();
-                    for pattern in &args[1..] {
-                        let rx = ctx.broadcaster.psubscribe_client(ctx.client_id, pattern);
-                        {
-                            let mut subs = ctx.subscribed_channels.write();
-                            subs.push(pattern.to_vec());
-                        }
-                        {
-                            let mut receivers = ctx.pubsub_receivers.write();
-                            receivers.push(rx);
-                        }
-                        let pat_str = String::from_utf8_lossy(pattern);
-                        response.push_str(&format!(
-                            "*3\r\n$10\r\npsubscribe\r\n${}\r\n{}\r\n:1\r\n",
-                            pattern.len(),
-                            pat_str
-                        ));
-                    }
-                    return response;
-                }
-                if cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE") || cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE") {
-                    for channel in &args[1..] {
-                        ctx.broadcaster.unsubscribe(ctx.client_id, channel);
-                    }
-                    return "*0\r\n".into();
-                }
-            }
-            12 => {
-                if cmd.eq_ignore_ascii_case(b"SISMEMBER") {
-                    if args.len() < 3 {
-                        return "-ERR wrong number of arguments\r\n".into();
-                    }
-                    let result = ctx.storage.sismember(args[1], args[2]);
-                    return match result {
-                        Ok(true) => ":1\r\n".into(),
-                        Ok(false) => ":0\r\n".into(),
-                        Err(e) => format!("-ERR {}\r\n", e),
-                    };
-                }
-                if cmd.eq_ignore_ascii_case(b"SMEMBERS") {
-                    if args.len() < 2 {
-                        return "-ERR wrong number of arguments\r\n".into();
-                    }
-                    let result = ctx.storage.smembers(args[1]);
-                    return match result {
-                        Ok(members) => {
-                            let mut resp = format!("*{}\r\n", members.len());
-                            for m in &members {
-                                resp.push_str(&format!("${}\r\n{}", m.len(), String::from_utf8_lossy(m)));
-                                resp.push_str("\r\n");
-                            }
-                            resp
-                        }
-                        Err(e) => format!("-ERR {}\r\n", e),
-                    };
-                }
-            }
-            _ => {}
-        }
-
-        // Fallback to string-based command processor for less common commands
-        let args_str: Vec<String> = args.iter().map(|a| {
-            match std::str::from_utf8(a) {
-                Ok(s) => s.to_owned(),
-                Err(_) => String::from_utf8_lossy(a).into_owned(),
-            }
-        }).collect();
-        Self::process_command(&args_str, ctx).await
-    }
-
     /// Ultra-fast command handler that writes directly to BytesMut buffer.
     /// Zero String allocations for the most common commands.
     #[inline(always)]
@@ -2237,28 +1861,57 @@ fn parse_inline(line: &str) -> Vec<String> {
     args
 }
 
+#[inline(always)]
 fn find_crlf(buf: &[u8]) -> Option<usize> {
-    // Use memchr for SIMD-accelerated \r search
-    let data = if buf.len() > 1 { &buf[..buf.len() - 1] } else { return None };
-    let mut pos = 0;
-    while pos < data.len() {
-        if let Some(idx) = memchr::memchr(b'\r', &data[pos..]) {
-            let abs = pos + idx;
-            if abs + 1 < buf.len() && buf[abs + 1] == b'\n' {
-                return Some(abs);
-            }
-            pos = abs + 1;
-        } else {
-            break;
+    let pos = memchr::memchr(b'\r', buf)?;
+    if pos + 1 < buf.len() && buf[pos + 1] == b'\n' {
+        Some(pos)
+    } else {
+        None
+    }
+}
+
+const MAX_RESP_ARGS: usize = 16;
+
+struct ZeroCopyArgs<'a> {
+    buf: [&'a [u8]; MAX_RESP_ARGS],
+    len: usize,
+}
+
+impl<'a> ZeroCopyArgs<'a> {
+    #[inline(always)]
+    fn new() -> Self {
+        ZeroCopyArgs {
+            buf: [b""; MAX_RESP_ARGS],
+            len: 0,
         }
     }
-    None
+
+    #[inline(always)]
+    fn push(&mut self, slice: &'a [u8]) {
+        if self.len < MAX_RESP_ARGS {
+            self.buf[self.len] = slice;
+            self.len += 1;
+        }
+    }
+
+    #[inline(always)]
+    fn as_slice(&self) -> &[&'a [u8]] {
+        &self.buf[..self.len]
+    }
+
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
 }
 
 /// Zero-copy RESP frame parser. Returns byte slices pointing into the original buffer.
-/// Returns (consumed_bytes, arg_slices).
-fn try_parse_resp_frame_zero_copy<'a>(buf: &'a [u8]) -> Option<(usize, Vec<&'a [u8]>)> {
-    if buf.is_empty() || buf[0] != b'*' {
+/// Returns (consumed_bytes, arg_slices) with stack-allocated args (no heap allocation).
+#[inline(always)]
+fn try_parse_resp_frame_zero_copy<'a>(buf: &'a [u8]) -> Option<(usize, ZeroCopyArgs<'a>)> {
+    if buf.len() < 4 || buf[0] != b'*' {
         return None;
     }
 
@@ -2266,8 +1919,12 @@ fn try_parse_resp_frame_zero_copy<'a>(buf: &'a [u8]) -> Option<(usize, Vec<&'a [
     let count_str = std::str::from_utf8(&buf[1..first_end]).ok()?;
     let count: usize = count_str.parse().ok()?;
 
+    if count > MAX_RESP_ARGS {
+        return None;
+    }
+
     let mut pos = first_end + 2;
-    let mut args: Vec<&'a [u8]> = Vec::with_capacity(count);
+    let mut args = ZeroCopyArgs::new();
 
     for _ in 0..count {
         if pos >= buf.len() || buf[pos] != b'$' {
@@ -2278,29 +1935,15 @@ fn try_parse_resp_frame_zero_copy<'a>(buf: &'a [u8]) -> Option<(usize, Vec<&'a [
         let len: usize = len_str.parse().ok()?;
         pos = len_end + 2;
 
-        if pos + len > buf.len() {
+        if pos + len + 2 > buf.len() {
             return None;
         }
 
-        // Zero-copy: just return a slice into the original buffer
         args.push(&buf[pos..pos + len]);
         pos += len + 2;
     }
 
     Some((pos, args))
-}
-
-/// Legacy wrapper for backward compatibility
-fn try_parse_resp_frame(buf: &[u8]) -> Option<(usize, Vec<String>)> {
-    try_parse_resp_frame_zero_copy(buf).map(|(consumed, slices)| {
-        let args: Vec<String> = slices.iter().map(|s| {
-            match std::str::from_utf8(s) {
-                Ok(s) => s.to_owned(),
-                Err(_) => String::from_utf8_lossy(s).into_owned(),
-            }
-        }).collect();
-        (consumed, args)
-    })
 }
 
 #[cfg(test)]
@@ -2349,38 +1992,40 @@ mod tests {
     #[test]
     fn parse_resp_simple() {
         let input = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
-        let (_, args) = try_parse_resp_frame(input).unwrap();
-        assert_eq!(args, vec!["SET", "foo", "bar"]);
+        let (_, args) = try_parse_resp_frame_zero_copy(input).unwrap();
+        let strs: Vec<&str> = args.as_slice().iter().map(|s| std::str::from_utf8(s).unwrap()).collect();
+        assert_eq!(strs, vec!["SET", "foo", "bar"]);
     }
 
     #[test]
     fn parse_resp_single_arg() {
         let input = b"*1\r\n$4\r\nPING\r\n";
-        let (_, args) = try_parse_resp_frame(input).unwrap();
-        assert_eq!(args, vec!["PING"]);
+        let (_, args) = try_parse_resp_frame_zero_copy(input).unwrap();
+        let strs: Vec<&str> = args.as_slice().iter().map(|s| std::str::from_utf8(s).unwrap()).collect();
+        assert_eq!(strs, vec!["PING"]);
     }
 
     #[test]
     fn parse_resp_empty_bulk_string() {
         let input = b"*2\r\n$3\r\nGET\r\n$0\r\n\r\n";
-        let (_, args) = try_parse_resp_frame(input).unwrap();
-        assert_eq!(args, vec!["GET", ""]);
+        let (_, args) = try_parse_resp_frame_zero_copy(input).unwrap();
+        let strs: Vec<&str> = args.as_slice().iter().map(|s| std::str::from_utf8(s).unwrap()).collect();
+        assert_eq!(strs, vec!["GET", ""]);
     }
 
     #[test]
     fn parse_resp_invalid_header() {
-        assert!(try_parse_resp_frame(b"$3\r\nSET\r\n").is_none());
+        assert!(try_parse_resp_frame_zero_copy(b"$3\r\nSET\r\n").is_none());
     }
 
     #[test]
     fn parse_resp_wrong_length() {
-        // $5\r\nSE\r\n is incomplete - needs 5 bytes but only 2 before \r\n
-        assert!(try_parse_resp_frame(b"*1\r\n$5\r\nSE\r\n").is_none());
+        assert!(try_parse_resp_frame_zero_copy(b"*1\r\n$5\r\nSE\r\n").is_none());
     }
 
     #[test]
     fn parse_resp_truncated() {
-        assert!(try_parse_resp_frame(b"*3\r\n$3\r\nSET\r\n").is_none());
+        assert!(try_parse_resp_frame_zero_copy(b"*3\r\n$3\r\nSET\r\n").is_none());
     }
 
     #[tokio::test]
