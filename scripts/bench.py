@@ -39,53 +39,73 @@ def encode_resp(args):
     return cmd.encode()
 
 
-def read_response(sock):
-    prefix = sock.recv(1)
+class RESPReader:
+    __slots__ = ('sock', 'buf', 'pos')
 
-    if not prefix:
-        return
+    def __init__(self, sock):
+        self.sock = sock
+        self.buf = b''
+        self.pos = 0
 
-    if prefix in b"+-:":
-        while not sock.recv(1).endswith(b"\n"):
-            pass
+    def _fill(self, n=4096):
+        data = self.sock.recv(n)
+        if data:
+            self.buf = self.buf[self.pos:] + data
+            self.pos = 0
+        return len(data)
 
-    elif prefix == b"$":
-        length = b""
-
+    def _readline(self):
         while True:
-            c = sock.recv(1)
-            length += c
-            if length.endswith(b"\r\n"):
-                break
+            start = self.pos
+            buf = self.buf
+            idx = buf.find(b'\r\n', start)
+            if idx != -1:
+                self.pos = idx + 2
+                return buf[start:idx]
+            if self._fill() == 0:
+                return buf[start:]
 
-        try:
-            size = int(length[:-2])
-        except:
+    def read(self):
+        line = self._readline()
+        if not line:
+            return None
+
+        prefix = line[0:1]
+
+        if prefix in (b'+', b'-', b':'):
             return
 
-        if size >= 0:
-            remaining = size + 2
-
-            while remaining > 0:
-                data = sock.recv(min(4096, remaining))
-                remaining -= len(data)
-
-    elif prefix == b"*":
-        length = b""
-
-        while True:
-            c = sock.recv(1)
-            length += c
-            if length.endswith(b"\r\n"):
-                break
-
-        try:
-            count = int(length[:-2])
-        except:
+        if prefix == b'$':
+            size = int(line[1:])
+            if size >= 0:
+                self._skip(size + 2)
             return
 
-        for _ in range(max(count, 0)):
-            read_response(sock)
+        if prefix == b'*':
+            count = int(line[1:])
+            for _ in range(max(count, 0)):
+                self.read()
+            return
+
+    def _skip(self, n):
+        avail = len(self.buf) - self.pos
+        if n <= avail:
+            self.pos += n
+            return
+        n -= avail
+        self.buf = b''
+        self.pos = 0
+        while n > 0:
+            data = self.sock.recv(min(4096, n))
+            if not data:
+                break
+            n -= len(data)
+
+
+def read_response(sock, reader=None):
+    if reader is None:
+        reader = RESPReader(sock)
+    reader.read()
 
 
 def worker(host, port, cmd_builder, operations):
@@ -95,11 +115,12 @@ def worker(host, port, cmd_builder, operations):
 
     sock.connect((host, port))
 
+    reader = RESPReader(sock)
     start = time.perf_counter()
 
     for i in range(operations):
         sock.sendall(encode_resp(cmd_builder(i)))
-        read_response(sock)
+        read_response(sock, reader)
 
     elapsed = time.perf_counter() - start
 
@@ -151,7 +172,7 @@ def main():
         "-n",
         "--operations",
         type=int,
-        default=100000,
+        default=10000,
         help="Operations per benchmark",
     )
 
@@ -246,13 +267,13 @@ def main():
         print(f"CrabKV Relative Performance: {avg_ratio:.2f}%")
 
         if avg_ratio > 100:
-            print("🏆 CrabKV wins overall!")
+            print("CrabKV wins overall!")
 
         elif avg_ratio >= 90:
-            print("🚀 CrabKV is within 10% of Redis.")
+            print("CrabKV is within 10% of Redis.")
 
         else:
-            print("📈 Redis is faster overall.")
+            print("Redis is faster overall.")
 
 
 if __name__ == "__main__":

@@ -165,6 +165,13 @@ impl Server {
                 accept_result = listener.accept() => {
                     match accept_result {
                         Ok((stream, peer_addr)) => {
+                            let current = active.load(Ordering::Relaxed);
+                            let max_conn = config.server.max_connections;
+                            if current >= max_conn as u64 {
+                                tracing::warn!("Max connections ({}) reached, rejecting {}", max_conn, peer_addr);
+                                drop(stream);
+                                continue;
+                            }
                             tracing::trace!("New connection from {}", peer_addr);
                             active.fetch_add(1, Ordering::Relaxed);
 
@@ -213,15 +220,15 @@ impl Server {
 
         let _ = stream.set_nodelay(true);
 
-        let mut stream = BufWriter::with_capacity(65536, stream);
-        let mut buf = Vec::with_capacity(65536);
+        let mut stream = BufWriter::with_capacity(131072, stream);
+        let mut buf = Vec::with_capacity(131072);
         let mut read_pos: usize = 0;
-        let mut resp_buf = BytesMut::with_capacity(65536);
+        let mut resp_buf = BytesMut::with_capacity(131072);
         // Cache subscribed state to avoid RwLock on every iteration
         let mut is_subscribed = false;
 
         while running.load(Ordering::SeqCst) {
-            if read_pos > 0 && read_pos >= buf.len() / 2 {
+            if read_pos > 0 && read_pos >= buf.len() * 85 / 100 {
                 let remaining = buf.len() - read_pos;
                 if remaining > 0 {
                     buf.copy_within(read_pos.., 0);
@@ -238,12 +245,23 @@ impl Server {
                         spare.len(),
                     )
                 };
-                match stream.get_mut().read(write_slice).await {
+                let read_result = match tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    stream.get_mut().read(write_slice),
+                ).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        tracing::debug!(client_id = ctx.client_id, "Connection timed out");
+                        break;
+                    }
+                };
+                match read_result {
                     Ok(0) => {
                         tracing::trace!(client_id = ctx.client_id, "Client disconnected");
                         break;
                     }
                     Ok(n) => {
+                        debug_assert!(n <= spare.len());
                         unsafe { buf.set_len(buf.len() + n); }
                     }
                     Err(e) => {
@@ -252,7 +270,7 @@ impl Server {
                     }
                 }
             } else {
-                buf.reserve(65536);
+                buf.reserve(131072);
             }
 
             loop {
@@ -396,9 +414,10 @@ impl Server {
                                 _ => i += 1,
                             }
                         }
-                        ctx.storage.set(key.to_vec(), StorageValue::String(Bytes::from(val.to_vec())));
                         if let Some(t) = ttl {
-                            ctx.storage.expire(key, t);
+                            ctx.storage.set_with_ttl(key.to_vec(), StorageValue::String(Bytes::copy_from_slice(val)), t);
+                        } else {
+                            ctx.storage.set(key.to_vec(), StorageValue::String(Bytes::copy_from_slice(val)));
                         }
                         return "+OK\r\n".into();
                     }
@@ -510,9 +529,10 @@ impl Server {
                         _ => i += 1,
                     }
                 }
-                ctx.storage.set(key.to_vec(), StorageValue::String(Bytes::from(val.to_vec())));
                 if let Some(t) = ttl {
-                    ctx.storage.expire(key, t);
+                    ctx.storage.set_with_ttl(key.to_vec(), StorageValue::String(Bytes::copy_from_slice(val)), t);
+                } else {
+                    ctx.storage.set(key.to_vec(), StorageValue::String(Bytes::copy_from_slice(val)));
                 }
                 "+OK\r\n".into()
             }
@@ -1344,9 +1364,10 @@ impl Server {
                             i += 1;
                         }
                     }
-                    ctx.storage.set(key.to_vec(), StorageValue::String(Bytes::from(val.to_vec())));
                     if let Some(t) = ttl {
-                        ctx.storage.expire(key, t);
+                        ctx.storage.set_with_ttl(key.to_vec(), StorageValue::String(Bytes::copy_from_slice(val)), t);
+                    } else {
+                        ctx.storage.set(key.to_vec(), StorageValue::String(Bytes::copy_from_slice(val)));
                     }
                     buf.put_slice(RESP_OK);
                     return;
@@ -1475,7 +1496,7 @@ impl Server {
                     }
                     let mut i = 1;
                     while i + 1 < args.len() {
-                        ctx.storage.set(args[i].to_vec(), StorageValue::String(Bytes::from(args[i + 1].to_vec())));
+                        ctx.storage.set(args[i].to_vec(), StorageValue::String(Bytes::copy_from_slice(args[i + 1])));
                         i += 2;
                     }
                     buf.put_slice(RESP_OK);
@@ -1795,13 +1816,13 @@ fn find_crlf(buf: &[u8]) -> Option<usize> {
 const MAX_RESP_ARGS: usize = 4096;
 
 struct ZeroCopyArgs<'a> {
-    buf: Vec<&'a [u8]>,
+    buf: smallvec::SmallVec<[&'a [u8]; 16]>,
 }
 
 impl<'a> ZeroCopyArgs<'a> {
     fn with_capacity(cap: usize) -> Self {
         ZeroCopyArgs {
-            buf: Vec::with_capacity(cap.min(MAX_RESP_ARGS)),
+            buf: smallvec::SmallVec::with_capacity(cap.min(MAX_RESP_ARGS)),
         }
     }
 
@@ -1851,12 +1872,13 @@ fn try_parse_resp_frame_zero_copy<'a>(buf: &'a [u8]) -> Option<(usize, ZeroCopyA
         let len: usize = len_str.parse().ok()?;
         pos = len_end + 2;
 
-        if pos + len + 2 > buf.len() {
+        let end = pos.checked_add(len)?.checked_add(2)?;
+        if end > buf.len() {
             return None;
         }
 
         args.push(&buf[pos..pos + len]);
-        pos += len + 2;
+        pos = end;
     }
 
     Some((pos, args))

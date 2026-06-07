@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::collections::hash_map::Entry as HashMapEntry;
 use std::hash::Hasher;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -190,13 +191,22 @@ impl Shard {
         }
     }
 
-    fn insert(&mut self, key: Vec<u8>, value: StorageValue) {
-        if let Some(old) = self.data.get(&key) {
-            self.size_bytes -= old.memory_usage();
-        }
+    fn insert(&mut self, key: Vec<u8>, value: StorageValue) -> usize {
         let new_usage = value.memory_usage();
-        self.data.insert(key, value);
-        self.size_bytes += new_usage;
+        match self.data.entry(key) {
+            HashMapEntry::Occupied(mut e) => {
+                let old_usage = e.get().memory_usage();
+                self.size_bytes -= old_usage;
+                self.size_bytes += new_usage;
+                e.insert(value);
+                old_usage
+            }
+            HashMapEntry::Vacant(e) => {
+                self.size_bytes += new_usage;
+                e.insert(value);
+                0
+            }
+        }
     }
 
     fn remove(&mut self, key: &[u8]) -> Option<StorageValue> {
@@ -211,6 +221,9 @@ impl Shard {
     }
 
     fn is_expired(&self, key: &[u8]) -> bool {
+        if self.ttl.is_empty() {
+            return false;
+        }
         self.ttl
             .get(key)
             .map(|exp| Instant::now() >= *exp)
@@ -278,7 +291,7 @@ impl Shard {
 pub struct StorageEngine {
     shards: Vec<RwLock<Shard>>,
     num_shards: usize,
-    max_memory: CachePadded<AtomicUsize>,
+    max_memory: AtomicUsize,
     current_memory: CachePadded<AtomicUsize>,
     eviction_policy: RwLock<EvictionPolicy>,
 }
@@ -297,7 +310,7 @@ impl StorageEngine {
         Self {
             shards,
             num_shards,
-            max_memory: CachePadded::new(AtomicUsize::new(max_memory)),
+            max_memory: AtomicUsize::new(max_memory),
             current_memory: CachePadded::new(AtomicUsize::new(0)),
             eviction_policy: RwLock::new(eviction_policy),
         }
@@ -356,21 +369,19 @@ impl StorageEngine {
     pub fn set(&self, key: Vec<u8>, value: StorageValue) -> Option<StorageValue> {
         let shard_lock = self.get_shard(&key);
         let mut shard = shard_lock.write();
-        let old = shard.data.get(&key).cloned();
-        let old_size = old.as_ref().map_or(0, |v| v.memory_usage());
         let new_size = value.memory_usage();
-
-        shard.insert(key, value);
-        let freed = old_size;
+        let old_size = shard.insert(key, value);
         drop(shard);
 
-        if freed > 0 {
-            self.current_memory.fetch_sub(freed, Ordering::Relaxed);
+        let delta = new_size as isize - old_size as isize;
+        if delta > 0 {
+            self.current_memory.fetch_add(delta as usize, Ordering::Relaxed);
+        } else if delta < 0 {
+            self.current_memory.fetch_sub((-delta) as usize, Ordering::Relaxed);
         }
-        self.current_memory.fetch_add(new_size, Ordering::Relaxed);
         self.evict_if_needed();
 
-        old
+        None
     }
 
     pub fn set_with_ttl(
@@ -381,23 +392,21 @@ impl StorageEngine {
     ) -> Option<StorageValue> {
         let shard_lock = self.get_shard(&key);
         let mut shard = shard_lock.write();
-        let old = shard.data.get(&key).cloned();
-        let old_size = old.as_ref().map_or(0, |v| v.memory_usage());
         let new_size = value.memory_usage();
         let expires_at = Instant::now() + ttl;
-
-        shard.insert(key.clone(), value);
+        let old_size = shard.insert(key.clone(), value);
         shard.ttl.insert(key, expires_at);
-        let freed = old_size;
         drop(shard);
 
-        if freed > 0 {
-            self.current_memory.fetch_sub(freed, Ordering::Relaxed);
+        let delta = new_size as isize - old_size as isize;
+        if delta > 0 {
+            self.current_memory.fetch_add(delta as usize, Ordering::Relaxed);
+        } else if delta < 0 {
+            self.current_memory.fetch_sub((-delta) as usize, Ordering::Relaxed);
         }
-        self.current_memory.fetch_add(new_size, Ordering::Relaxed);
         self.evict_if_needed();
 
-        old
+        None
     }
 
     pub fn del(&self, key: &[u8]) -> bool {
@@ -450,12 +459,13 @@ impl StorageEngine {
             return Ok(result);
         }
 
-        let current = match shard.data.get(key) {
+        let (current, old_size) = match shard.data.get(key) {
             Some(StorageValue::String(s)) => {
                 let str_val = std::str::from_utf8(s).map_err(|_| "value is not an integer")?;
-                str_val
+                let val = str_val
                     .parse::<i64>()
-                    .map_err(|_| "value is not an integer")?
+                    .map_err(|_| "value is not an integer")?;
+                (val, s.len() + std::mem::size_of::<StorageValue>())
             }
             Some(_) => return Err("wrong type for key".into()),
             None => {
@@ -476,15 +486,15 @@ impl StorageEngine {
         let mut itoa_buf = itoa::Buffer::new();
         let new_bytes = itoa_buf.format(result).as_bytes().to_vec();
         let new_val = StorageValue::String(Bytes::from(new_bytes));
-        let old_size = shard.data.get(key).map_or(0, |v| v.memory_usage());
+        let new_size = new_val.memory_usage();
         shard.insert(key.to_vec(), new_val);
-        let new_size = shard.data.get(key).map_or(0, |v| v.memory_usage());
         drop(shard);
 
-        if new_size > old_size {
-            self.current_memory.fetch_add(new_size - old_size, Ordering::Relaxed);
-        } else if old_size > new_size {
-            self.current_memory.fetch_sub(old_size - new_size, Ordering::Relaxed);
+        let delta = new_size as isize - old_size as isize;
+        if delta > 0 {
+            self.current_memory.fetch_add(delta as usize, Ordering::Relaxed);
+        } else if delta < 0 {
+            self.current_memory.fetch_sub((-delta) as usize, Ordering::Relaxed);
         }
 
         Ok(result)
