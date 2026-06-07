@@ -26,6 +26,9 @@ pub struct Cli {
 
     #[arg(long)]
     pub metrics_port: Option<u16>,
+
+    #[arg(long)]
+    pub debug: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -43,6 +46,8 @@ pub struct ServerConfig {
     pub bind: String,
     pub port: u16,
     pub max_connections: usize,
+    #[serde(default)]
+    pub debug: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -84,6 +89,7 @@ impl Default for Config {
                 bind: "0.0.0.0".into(),
                 port: 6379,
                 max_connections: 10000,
+                debug: true,
             },
             memory: MemoryConfig {
                 max_memory: "8GB".into(),
@@ -132,6 +138,10 @@ impl Config {
 
         if let Some(mp) = cli.metrics_port {
             self.metrics.port = mp;
+        }
+
+        if cli.debug {
+            self.server.debug = true;
         }
     }
 
@@ -245,6 +255,7 @@ mod tests {
             max_memory: Some("4GB".into()),
             cluster: true,
             metrics_port: Some(8080),
+            debug: false,
         };
         config.apply_cli(&cli);
         assert_eq!(config.server.bind, "127.0.0.1");
@@ -264,6 +275,7 @@ mod tests {
             max_memory: None,
             cluster: false,
             metrics_port: None,
+            debug: false,
         };
         config.apply_cli(&cli);
         assert_eq!(config.server.bind, "127.0.0.1");

@@ -1,6 +1,7 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+
+use ahash::AHashMap;
 
 use crate::jobs::JobQueue;
 use crate::protocol::RespValue;
@@ -588,7 +589,7 @@ pub fn dispatch_command(ctx: &CommandContext, args: &[RespValue]) -> RespValue {
                 Ok(s) => s,
                 Err(e) => return e,
             };
-            let mut fields = HashMap::new();
+            let mut fields = AHashMap::new();
             let mut i = 2;
             while i < args.len() {
                 let field = match extract_arg(&args, i) {

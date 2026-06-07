@@ -1,10 +1,14 @@
 use clap::Parser;
 use crabkv::config::{Cli, Config};
 use crabkv::server::Server;
+use tracing_subscriber::EnvFilter;
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init();
     let cli = Cli::parse();
 
     let mut config = match &cli.config {
@@ -13,10 +17,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     config.apply_cli(&cli);
 
-    log::info!(
-        "CrabKV starting on {}:{}",
+    let filter = if config.server.debug {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"))
+    } else {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
+    };
+
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .init();
+
+    tracing::info!(
+        "CrabKV starting on {}:{} (debug={})",
         config.server.bind,
-        config.server.port
+        config.server.port,
+        config.server.debug
     );
 
     let server = Server::new(config).await;

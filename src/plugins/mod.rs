@@ -48,12 +48,12 @@ impl PluginManager {
     }
 
     pub fn register_plugin(&mut self, plugin: Box<dyn Plugin>) {
-        log::info!("Registered plugin: {}", plugin.name());
+        tracing::info!("Registered plugin: {}", plugin.name());
         self.plugins.push(plugin);
     }
 
     pub fn register_auth_plugin(&mut self, plugin: Box<dyn AuthPlugin>) {
-        log::info!("Registered auth plugin: {}", plugin.name());
+        tracing::info!("Registered auth plugin: {}", plugin.name());
         self.auth_plugins.push(plugin);
     }
 

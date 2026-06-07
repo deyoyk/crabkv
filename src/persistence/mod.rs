@@ -19,6 +19,7 @@ pub enum AOFFsyncPolicy {
 
 pub struct AofWriter {
     writer: Mutex<BufWriter<File>>,
+    #[allow(dead_code)]
     path: PathBuf,
     fsync_policy: AOFFsyncPolicy,
 }

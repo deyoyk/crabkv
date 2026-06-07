@@ -1,10 +1,10 @@
-use std::collections::HashMap;
+use ahash::AHashMap;
 
 use crate::storage::StorageEngine;
 
 pub struct StreamEntry {
     pub id: u64,
-    pub fields: HashMap<Vec<u8>, Vec<u8>>,
+    pub fields: AHashMap<Vec<u8>, Vec<u8>>,
 }
 
 pub struct StreamEngine;
@@ -18,7 +18,7 @@ impl StreamEngine {
         &self,
         storage: &StorageEngine,
         stream: &[u8],
-        fields: HashMap<Vec<u8>, Vec<u8>>,
+        fields: AHashMap<Vec<u8>, Vec<u8>>,
     ) -> Result<u64, String> {
         storage.xadd(stream, fields)
     }
@@ -52,7 +52,7 @@ impl StreamEngine {
     }
 
     pub fn xlen(&self, storage: &StorageEngine, stream: &[u8]) -> usize {
-        storage.xrange(stream, 0, u64::MAX).map(|e| e.len()).unwrap_or(0)
+        storage.xlen(stream).unwrap_or(0)
     }
 }
 

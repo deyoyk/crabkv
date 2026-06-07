@@ -1,10 +1,12 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::hash::{BuildHasher, Hasher};
+use std::collections::{BTreeMap, VecDeque};
+use std::hash::Hasher;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ahash::AHasher;
+use ahash::{AHashMap, AHashSet, AHasher};
+use crossbeam_skiplist::SkipSet;
+use crossbeam_utils::CachePadded;
 use parking_lot::RwLock;
 use rand::Rng;
 
@@ -17,26 +19,63 @@ const LFU_DECAY_WINDOW: Duration = Duration::from_secs(60);
 // Core data types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum StorageValue {
     String(Vec<u8>),
-    List(Vec<Vec<u8>>),
-    Hash(HashMap<Vec<u8>, Vec<u8>>),
-    Set(HashSet<Vec<u8>>),
-    SortedSet(BTreeSet<(i64, Vec<u8>)>),
+    List(VecDeque<Vec<u8>>),
+    Hash(AHashMap<Vec<u8>, Vec<u8>>),
+    Set(AHashSet<Vec<u8>>),
+    SortedSet(SortedSetData),
     Stream(StreamData),
+}
+
+impl Clone for StorageValue {
+    fn clone(&self) -> Self {
+        match self {
+            StorageValue::String(v) => StorageValue::String(v.clone()),
+            StorageValue::List(v) => StorageValue::List(v.clone()),
+            StorageValue::Hash(v) => StorageValue::Hash(v.clone()),
+            StorageValue::Set(v) => StorageValue::Set(v.clone()),
+            StorageValue::SortedSet(data) => {
+                let mut new_data = SortedSetData::default();
+                for entry in data.tree.iter() {
+                    let (score, member) = entry.value().clone();
+                    new_data.tree.insert((score, member.clone()));
+                    new_data.member_index.insert(member, score);
+                }
+                StorageValue::SortedSet(new_data)
+            }
+            StorageValue::Stream(v) => StorageValue::Stream(v.clone()),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct SortedSetData {
+    pub tree: SkipSet<(i64, Vec<u8>)>,
+    pub member_index: AHashMap<Vec<u8>, i64>,
+}
+
+impl PartialEq for SortedSetData {
+    fn eq(&self, other: &Self) -> bool {
+        if self.tree.len() != other.tree.len() {
+            return false;
+        }
+        self.tree.iter().zip(other.tree.iter()).all(|(a, b)| a.value() == b.value())
+            && self.member_index == other.member_index
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StreamData {
-    pub entries: Vec<StreamEntry>,
+    pub entries: BTreeMap<u64, StreamEntry>,
     pub last_entry_id: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamEntry {
     pub id: u64,
-    pub fields: HashMap<Vec<u8>, Vec<u8>>,
+    pub fields: AHashMap<Vec<u8>, Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,15 +117,20 @@ impl StorageValue {
                         + s.len() * std::mem::size_of::<Vec<u8>>()
                 }
                 StorageValue::SortedSet(s) => {
-                    s.iter()
-                        .map(|(score, member)| std::mem::size_of::<i64>() + member.len())
+                    s.tree
+                        .iter()
+                        .map(|entry| {
+                            let (_score, member) = entry.value();
+                            std::mem::size_of::<i64>() + member.len()
+                        })
                         .sum::<usize>()
-                        + s.len() * std::mem::size_of::<(i64, Vec<u8>)>()
+                        + s.tree.len() * (std::mem::size_of::<i64>() + std::mem::size_of::<Vec<u8>>())
+                        + s.member_index.len() * (std::mem::size_of::<Vec<u8>>() + std::mem::size_of::<i64>())
                 }
                 StorageValue::Stream(s) => {
                     s.entries
                         .iter()
-                        .map(|e| {
+                        .map(|(_id, e)| {
                             std::mem::size_of::<u64>()
                                 + e.fields
                                     .iter()
@@ -129,18 +173,18 @@ pub struct Expiry {
 // ---------------------------------------------------------------------------
 
 pub struct Shard {
-    data: HashMap<Vec<u8>, StorageValue>,
-    ttl: HashMap<Vec<u8>, Instant>,
-    access_info: HashMap<Vec<u8>, AccessInfo>,
+    data: AHashMap<Vec<u8>, StorageValue>,
+    ttl: AHashMap<Vec<u8>, Instant>,
+    access_info: AHashMap<Vec<u8>, AccessInfo>,
     size_bytes: usize,
 }
 
 impl Shard {
     fn new() -> Self {
         Self {
-            data: HashMap::new(),
-            ttl: HashMap::new(),
-            access_info: HashMap::new(),
+            data: AHashMap::new(),
+            ttl: AHashMap::new(),
+            access_info: AHashMap::new(),
             size_bytes: 0,
         }
     }
@@ -192,15 +236,6 @@ impl Shard {
         expired
     }
 
-    fn update_access(&mut self, key: &[u8]) {
-        let now = Instant::now();
-        let info = self.access_info.entry(key.to_vec()).or_insert(AccessInfo {
-            count: 0,
-            last_access: now,
-        });
-        info.count += 1;
-        info.last_access = now;
-    }
 
     fn pick_victim_lfu(&self) -> Option<Vec<u8>> {
         let now = Instant::now();
@@ -242,8 +277,8 @@ impl Shard {
 pub struct StorageEngine {
     shards: Vec<RwLock<Shard>>,
     num_shards: usize,
-    max_memory: AtomicUsize,
-    current_memory: AtomicUsize,
+    max_memory: CachePadded<AtomicUsize>,
+    current_memory: CachePadded<AtomicUsize>,
     eviction_policy: RwLock<EvictionPolicy>,
 }
 
@@ -261,8 +296,8 @@ impl StorageEngine {
         Self {
             shards,
             num_shards,
-            max_memory: AtomicUsize::new(max_memory),
-            current_memory: AtomicUsize::new(0),
+            max_memory: CachePadded::new(AtomicUsize::new(max_memory)),
+            current_memory: CachePadded::new(AtomicUsize::new(0)),
             eviction_policy: RwLock::new(eviction_policy),
         }
     }
@@ -297,12 +332,9 @@ impl StorageEngine {
                 EvictionPolicy::Lru => shard.pick_victim_lru(),
             };
             if let Some(vk) = victim {
-                if let Some(val) = shard.data.remove(&vk) {
+                if let Some(val) = shard.remove(&vk) {
                     let freed = val.memory_usage();
                     self.current_memory.fetch_sub(freed, Ordering::Relaxed);
-                    shard.ttl.remove(&vk);
-                    shard.access_info.remove(&vk);
-                    shard.size_bytes -= val.memory_usage();
                 }
             }
         }
@@ -317,12 +349,7 @@ impl StorageEngine {
         if shard.is_expired(key) {
             return None;
         }
-        let result = shard.data.get(key).cloned();
-        drop(shard);
-        if result.is_some() {
-            self.get_shard(key).write().update_access(key);
-        }
-        result
+        shard.data.get(key).cloned()
     }
 
     pub fn set(&self, key: Vec<u8>, value: StorageValue) -> Option<StorageValue> {
@@ -445,10 +472,16 @@ impl StorageEngine {
         let result = current.checked_add(amount).ok_or("increment would overflow")?;
         let new_bytes = result.to_string().into_bytes();
         let new_val = StorageValue::String(new_bytes);
-        let new_size = new_val.memory_usage();
-
+        let old_size = shard.data.get(key).map_or(0, |v| v.memory_usage());
         shard.insert(key.to_vec(), new_val);
+        let new_size = shard.data.get(key).map_or(0, |v| v.memory_usage());
         drop(shard);
+
+        if new_size > old_size {
+            self.current_memory.fetch_add(new_size - old_size, Ordering::Relaxed);
+        } else if old_size > new_size {
+            self.current_memory.fetch_sub(old_size - new_size, Ordering::Relaxed);
+        }
 
         Ok(result)
     }
@@ -632,8 +665,8 @@ impl StorageEngine {
         match shard.data.get_mut(key) {
             Some(StorageValue::List(list)) => {
                 let old_size: usize = list.iter().map(|e| e.len()).sum();
-                for v in values.iter().rev() {
-                    list.insert(0, v.clone());
+                for v in values.into_iter().rev() {
+                    list.push_front(v);
                 }
                 let new_size: usize = list.iter().map(|e| e.len()).sum();
                 let len = list.len();
@@ -647,7 +680,7 @@ impl StorageEngine {
             }
             Some(_) => Err("wrong type for key".into()),
             None => {
-                let list: Vec<Vec<u8>> = values.into_iter().rev().collect();
+                let list: VecDeque<Vec<u8>> = values.into_iter().rev().collect();
                 let len = list.len();
                 let val = StorageValue::List(list);
                 let mem = val.memory_usage();
@@ -673,7 +706,7 @@ impl StorageEngine {
             Some(StorageValue::List(list)) => {
                 let old_size: usize = list.iter().map(|e| e.len()).sum();
                 for v in values {
-                    list.push(v);
+                    list.push_back(v);
                 }
                 let new_size: usize = list.iter().map(|e| e.len()).sum();
                 let len = list.len();
@@ -687,8 +720,9 @@ impl StorageEngine {
             }
             Some(_) => Err("wrong type for key".into()),
             None => {
-                let len = values.len();
-                let val = StorageValue::List(values);
+                let list: VecDeque<Vec<u8>> = values.into_iter().collect();
+                let len = list.len();
+                let val = StorageValue::List(list);
                 let mem = val.memory_usage();
                 shard.insert(key.to_vec(), val);
                 drop(shard);
@@ -713,7 +747,7 @@ impl StorageEngine {
                 if list.is_empty() {
                     return Ok(None);
                 }
-                let item = list.remove(0);
+                let item = list.pop_front().unwrap();
                 let removed_size = item.len() + std::mem::size_of::<Vec<u8>>();
                 drop(shard);
                 self.current_memory
@@ -738,7 +772,7 @@ impl StorageEngine {
                 if list.is_empty() {
                     return Ok(None);
                 }
-                let item = list.pop().unwrap();
+                let item = list.pop_back().unwrap();
                 let removed_size = item.len() + std::mem::size_of::<Vec<u8>>();
                 drop(shard);
                 self.current_memory
@@ -763,7 +797,7 @@ impl StorageEngine {
                 if start > stop || start >= len {
                     return Ok(Vec::new());
                 }
-                Ok(list[start as usize..=stop as usize].to_vec())
+                Ok(list.range(start as usize..=stop as usize).cloned().collect())
             }
             Some(_) => Err("wrong type for key".into()),
             None => Ok(Vec::new()),
@@ -840,24 +874,21 @@ impl StorageEngine {
 
         match shard.data.get_mut(key) {
             Some(StorageValue::Hash(map)) => {
-                let existed = map.contains_key(&field);
-                let old_mem: usize = map.iter().map(|(k, v)| k.len() + v.len()).sum();
-                map.insert(field, value);
-                let new_mem: usize = map.iter().map(|(k, v)| k.len() + v.len()).sum();
-                let diff = (new_mem as isize) - (old_mem as isize);
+                let old_field_val_size = map.get(&field).map_or(0, |v| field.len() + v.len());
+                let existed = map.insert(field.clone(), value.clone()).is_some();
+                let new_field_val_size = field.len() + value.len();
+                let diff = (new_field_val_size as isize) - (old_field_val_size as isize);
                 drop(shard);
                 if diff > 0 {
-                    self.current_memory
-                        .fetch_add(diff as usize, Ordering::Relaxed);
+                    self.current_memory.fetch_add(diff as usize, Ordering::Relaxed);
                 } else if diff < 0 {
-                    self.current_memory
-                        .fetch_sub((-diff) as usize, Ordering::Relaxed);
+                    self.current_memory.fetch_sub((-diff) as usize, Ordering::Relaxed);
                 }
                 Ok(!existed)
             }
             Some(_) => Err("wrong type for key".into()),
             None => {
-                let mut map = HashMap::new();
+                let mut map = AHashMap::new();
                 map.insert(field, value);
                 let val = StorageValue::Hash(map);
                 let mem = val.memory_usage();
@@ -908,7 +939,7 @@ impl StorageEngine {
         }
     }
 
-    pub fn hgetall(&self, key: &[u8]) -> Result<HashMap<Vec<u8>, Vec<u8>>, String> {
+    pub fn hgetall(&self, key: &[u8]) -> Result<AHashMap<Vec<u8>, Vec<u8>>, String> {
         let shard = self.get_shard(key).read();
         if shard.is_expired(key) {
             return Err("key does not exist".into());
@@ -916,7 +947,7 @@ impl StorageEngine {
         match shard.data.get(key) {
             Some(StorageValue::Hash(map)) => Ok(map.clone()),
             Some(_) => Err("wrong type for key".into()),
-            None => Ok(HashMap::new()),
+            None => Ok(AHashMap::new()),
         }
     }
 
@@ -934,25 +965,21 @@ impl StorageEngine {
 
         match shard.data.get_mut(key) {
             Some(StorageValue::Set(set)) => {
-                let old_size: usize = set.iter().map(|e| e.len()).sum();
                 let mut added = 0;
                 for m in members {
-                    if set.insert(m) {
+                    if set.insert(m.clone()) {
                         added += 1;
+                        self.current_memory.fetch_add(
+                            m.len() + std::mem::size_of::<Vec<u8>>(),
+                            Ordering::Relaxed,
+                        );
                     }
-                }
-                let new_size: usize = set.iter().map(|e| e.len()).sum();
-                let diff = (new_size as isize) - (old_size as isize);
-                drop(shard);
-                if diff > 0 {
-                    self.current_memory
-                        .fetch_add(diff as usize, Ordering::Relaxed);
                 }
                 Ok(added)
             }
             Some(_) => Err("wrong type for key".into()),
             None => {
-                let mut set = HashSet::new();
+                let mut set = AHashSet::new();
                 let mut added = 0;
                 for m in members {
                     if set.insert(m) {
@@ -983,7 +1010,7 @@ impl StorageEngine {
         }
     }
 
-    pub fn smembers(&self, key: &[u8]) -> Result<HashSet<Vec<u8>>, String> {
+    pub fn smembers(&self, key: &[u8]) -> Result<AHashSet<Vec<u8>>, String> {
         let shard = self.get_shard(key).read();
         if shard.is_expired(key) {
             return Err("key does not exist".into());
@@ -991,7 +1018,7 @@ impl StorageEngine {
         match shard.data.get(key) {
             Some(StorageValue::Set(set)) => Ok(set.clone()),
             Some(_) => Err("wrong type for key".into()),
-            None => Ok(HashSet::new()),
+            None => Ok(AHashSet::new()),
         }
     }
 
@@ -1008,34 +1035,23 @@ impl StorageEngine {
         }
 
         match shard.data.get_mut(key) {
-            Some(StorageValue::SortedSet(set)) => {
-                let old_len = set.len();
-                let to_remove: Vec<(i64, Vec<u8>)> = set
-                    .iter()
-                    .filter(|(_, m)| *m == member)
-                    .cloned()
-                    .collect();
-                for entry in &to_remove {
-                    set.remove(entry);
-                }
-                let existed = set.len() < old_len;
-                set.insert((score, member));
-                let new_len = set.len();
-                let diff = (new_len as isize) - (old_len as isize);
-                drop(shard);
-                if diff > 0 {
-                    self.current_memory.fetch_add(
-                        diff as usize * std::mem::size_of::<(i64, Vec<u8>)>(),
-                        Ordering::Relaxed,
-                    );
-                }
+            Some(StorageValue::SortedSet(data)) => {
+                let existed = if let Some(old_score) = data.member_index.get(&member).copied() {
+                    data.tree.remove(&(old_score, member.clone()));
+                    true
+                } else {
+                    false
+                };
+                data.member_index.insert(member.clone(), score);
+                data.tree.insert((score, member));
                 Ok(!existed)
             }
             Some(_) => Err("wrong type for key".into()),
             None => {
-                let mut set = BTreeSet::new();
-                set.insert((score, member));
-                let val = StorageValue::SortedSet(set);
+                let mut data = SortedSetData::default();
+                data.member_index.insert(member.clone(), score);
+                data.tree.insert((score, member));
+                let val = StorageValue::SortedSet(data);
                 let mem = val.memory_usage();
                 shard.insert(key.to_vec(), val);
                 drop(shard);
@@ -1053,8 +1069,8 @@ impl StorageEngine {
             return Err("key does not exist".into());
         }
         match shard.data.get(key) {
-            Some(StorageValue::SortedSet(set)) => {
-                Ok(set.iter().find(|(_, m)| m == member).map(|(s, _)| *s))
+            Some(StorageValue::SortedSet(data)) => {
+                Ok(data.member_index.get(member).copied())
             }
             Some(_) => Err("wrong type for key".into()),
             None => Ok(None),
@@ -1072,8 +1088,8 @@ impl StorageEngine {
             return Err("key does not exist".into());
         }
         match shard.data.get(key) {
-            Some(StorageValue::SortedSet(set)) => {
-                let items: Vec<(i64, Vec<u8>)> = set.iter().cloned().collect();
+            Some(StorageValue::SortedSet(data)) => {
+                let items: Vec<(i64, Vec<u8>)> = data.tree.iter().map(|e| e.value().clone()).collect();
                 if items.is_empty() || start >= items.len() {
                     return Ok(Vec::new());
                 }
@@ -1092,7 +1108,7 @@ impl StorageEngine {
     // Stream operations
     // -----------------------------------------------------------------------
 
-    pub fn xadd(&self, key: &[u8], fields: HashMap<Vec<u8>, Vec<u8>>) -> Result<u64, String> {
+    pub fn xadd(&self, key: &[u8], fields: AHashMap<Vec<u8>, Vec<u8>>) -> Result<u64, String> {
         let shard_lock = self.get_shard(key);
         let mut shard = shard_lock.write();
 
@@ -1104,14 +1120,14 @@ impl StorageEngine {
             Some(StorageValue::Stream(stream)) => {
                 stream.last_entry_id += 1;
                 let id = stream.last_entry_id;
-                stream.entries.push(StreamEntry { id, fields });
+                stream.entries.insert(id, StreamEntry { id, fields });
                 Ok(id)
             }
             Some(_) => Err("wrong type for key".into()),
             None => {
                 let mut stream = StreamData::default();
                 stream.last_entry_id = 1;
-                stream.entries.push(StreamEntry { id: 1, fields });
+                stream.entries.insert(1, StreamEntry { id: 1, fields });
                 let val = StorageValue::Stream(stream);
                 let mem = val.memory_usage();
                 shard.insert(key.to_vec(), val);
@@ -1137,12 +1153,23 @@ impl StorageEngine {
         match shard.data.get(key) {
             Some(StorageValue::Stream(stream)) => Ok(stream
                 .entries
-                .iter()
-                .filter(|e| e.id >= start_id && e.id <= end_id)
-                .cloned()
+                .range(start_id..=end_id)
+                .map(|(_id, entry)| entry.clone())
                 .collect()),
             Some(_) => Err("wrong type for key".into()),
             None => Ok(Vec::new()),
+        }
+    }
+
+    pub fn xlen(&self, key: &[u8]) -> Result<usize, String> {
+        let shard = self.get_shard(key).read();
+        if shard.is_expired(key) {
+            return Err("key does not exist".into());
+        }
+        match shard.data.get(key) {
+            Some(StorageValue::Stream(stream)) => Ok(stream.entries.len()),
+            Some(_) => Err("wrong type for key".into()),
+            None => Ok(0),
         }
     }
 
@@ -1511,7 +1538,7 @@ mod tests {
     fn test_stream_ops() {
         let e = engine();
         let key = b"mystream".to_vec();
-        let mut fields = HashMap::new();
+        let mut fields = AHashMap::new();
         fields.insert(b"field1".to_vec(), b"val1".to_vec());
 
         let id1 = e.xadd(&key, fields.clone()).unwrap();
@@ -1537,7 +1564,7 @@ mod tests {
         assert!(e.hget(b"str", b"f").is_err());
         assert!(e.sismember(b"str", b"m").is_err());
         assert!(e.zscore(b"str", b"m").is_err());
-        assert!(e.xadd(b"str", HashMap::new()).is_err());
+        assert!(e.xadd(b"str", AHashMap::new()).is_err());
     }
 
     #[test]

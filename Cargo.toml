@@ -6,6 +6,8 @@ description = "A next-generation distributed data platform written in Rust"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+mimalloc = "0.1"
+itoa = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 bytes = "1"
@@ -18,10 +20,25 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }
-log = "0.4"
-env_logger = "0.11"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
 futures = "0.3"
+hashbrown = "0.15"
+smallvec = "1"
+memchr = "2"
+crossbeam = "0.8"
+crossbeam-queue = "0.3"
+crossbeam-skiplist = "0.1"
+crossbeam-utils = "0.8"
+slab = "0.4"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+opt-level = 3
+strip = true
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

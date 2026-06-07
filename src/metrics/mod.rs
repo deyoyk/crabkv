@@ -111,7 +111,7 @@ impl MetricsServer {
     pub async fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
         let metrics = self.metrics.clone();
         let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", self.port)).await?;
-        log::info!("Metrics server listening on port {}", self.port);
+        tracing::info!("Metrics server listening on port {}", self.port);
 
         loop {
             let (mut stream, _) = listener.accept().await?;
