@@ -1462,6 +1462,7 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                             i += 1;
                         }
                     }
+                    tracing::debug!(key = %String::from_utf8_lossy(key), val_len = val.len(), ?ttl, "SET");
                     ctx.storage.set(key.to_vec(), StorageValue::String(val.to_vec()));
                     if let Some(t) = ttl {
                         ctx.storage.expire(key, t);
@@ -1474,6 +1475,7 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                         resp_write_error(buf, b"ERR wrong number of arguments for 'GET' command");
                         return;
                     }
+                    tracing::debug!(key = %String::from_utf8_lossy(args[1]), "GET");
                     match ctx.storage.get(args[1]) {
                         Some(StorageValue::String(s)) => {
                             resp_write_bulk_string(buf, &s);
@@ -1492,6 +1494,7 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                         resp_write_error(buf, b"ERR wrong number of arguments for 'DEL' command");
                         return;
                     }
+                    tracing::debug!(keys = ?args[1..].iter().map(|k| String::from_utf8_lossy(k).to_string()).collect::<Vec<_>>(), "DEL");
                     let mut count = 0u64;
                     for key in &args[1..] {
                         if ctx.storage.del(key) {
@@ -1504,6 +1507,7 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
             }
             4 => {
                 if cmd.eq_ignore_ascii_case(b"PING") {
+                    tracing::debug!("PING");
                     if args.len() > 1 {
                         resp_write_simple_string(buf, args[1]);
                     } else {
@@ -1512,6 +1516,7 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                     return;
                 }
                 if cmd.eq_ignore_ascii_case(b"ECHO") {
+                    tracing::debug!("ECHO");
                     if args.len() < 2 {
                         resp_write_error(buf, b"ERR wrong number of arguments for 'ECHO' command");
                         return;
@@ -1520,6 +1525,7 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                     return;
                 }
                 if cmd.eq_ignore_ascii_case(b"QUIT") {
+                    tracing::debug!("QUIT");
                     buf.put_slice(b"__CLOSE__");
                     return;
                 }
@@ -1529,10 +1535,41 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                         return;
                     }
                     let amount = if cmd[0] == b'I' || cmd[0] == b'i' { 1 } else { -1 };
+                    tracing::debug!(key = %String::from_utf8_lossy(args[1]), amount, "INCR/DECR");
                     match ctx.storage.incr(args[1], amount) {
                         Ok(n) => resp_write_integer(buf, n),
                         Err(e) => {
                             resp_write_error(buf, e.as_bytes());
+                        }
+                    }
+                    return;
+                }
+                if cmd.eq_ignore_ascii_case(b"MSET") {
+                    tracing::debug!(pair_count = (args.len() - 1) / 2, "MSET");
+                    if args.len() < 3 || (args.len() - 1) % 2 != 0 {
+                        resp_write_error(buf, b"ERR wrong number of arguments for 'MSET' command");
+                        return;
+                    }
+                    let mut i = 1;
+                    while i + 1 < args.len() {
+                        ctx.storage.set(args[i].to_vec(), StorageValue::String(args[i + 1].to_vec()));
+                        i += 2;
+                    }
+                    buf.put_slice(RESP_OK);
+                    return;
+                }
+                if cmd.eq_ignore_ascii_case(b"MGET") {
+                    tracing::debug!(key_count = args.len() - 1, "MGET");
+                    if args.len() < 2 {
+                        resp_write_error(buf, b"ERR wrong number of arguments for 'MGET' command");
+                        return;
+                    }
+                    resp_write_array_header(buf, args.len() - 1);
+                    for key in &args[1..] {
+                        match ctx.storage.get(key) {
+                            Some(StorageValue::String(s)) => resp_write_bulk_string(buf, &s),
+                            Some(_) => resp_write_error(buf, b"ERR WRONGTYPE Operation against a key"),
+                            None => buf.put_slice(RESP_NULL),
                         }
                     }
                     return;
@@ -1544,6 +1581,7 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                         resp_write_error(buf, b"ERR wrong number of arguments");
                         return;
                     }
+                    tracing::debug!(keys = ?args[1..].iter().map(|k| String::from_utf8_lossy(k).to_string()).collect::<Vec<_>>(), "EXISTS");
                     let mut count = 0u64;
                     for key in &args[1..] {
                         if ctx.storage.exists(key) {
@@ -1556,6 +1594,7 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
             }
             6 => {
                 if cmd.eq_ignore_ascii_case(b"DBSIZE") {
+                    tracing::debug!("DBSIZE");
                     resp_write_integer(buf, ctx.storage.dbsize() as i64);
                     return;
                 }
@@ -1568,6 +1607,7 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                         .map(|s| s.parse().unwrap_or(0))
                         .unwrap_or(0);
                     let amount = if cmd[0] == b'I' || cmd[0] == b'i' { amount } else { -amount };
+                    tracing::debug!(key = %String::from_utf8_lossy(args[1]), amount, "INCRBY/DECRBY");
                     match ctx.storage.incr(args[1], amount) {
                         Ok(n) => resp_write_integer(buf, n),
                         Err(e) => {
@@ -1584,6 +1624,7 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                         return;
                     }
                     let vals: Vec<Vec<u8>> = args[2..].iter().map(|a| a.to_vec()).collect();
+                    tracing::debug!(key = %String::from_utf8_lossy(args[1]), count = vals.len(), cmd = %String::from_utf8_lossy(cmd), "LPUSH/RPUSH");
                     let result = if cmd[0] == b'L' || cmd[0] == b'l' {
                         ctx.storage.lpush(args[1], vals)
                     } else {
@@ -1598,6 +1639,7 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                     return;
                 }
                 if cmd.eq_ignore_ascii_case(b"FLUSHALL") || cmd.eq_ignore_ascii_case(b"FLUSHDB") {
+                    tracing::debug!("FLUSHALL/FLUSHDB");
                     ctx.storage.flush_all();
                     buf.put_slice(RESP_OK);
                     return;
@@ -1609,6 +1651,7 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                         resp_write_error(buf, b"ERR wrong number of arguments");
                         return;
                     }
+                    tracing::debug!(key = %String::from_utf8_lossy(args[1]), cmd = %String::from_utf8_lossy(cmd), "LPOP/RPOP");
                     let result = if cmd[0] == b'L' || cmd[0] == b'l' {
                         ctx.storage.lpop(args[1])
                     } else {
@@ -1628,6 +1671,7 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                         resp_write_error(buf, b"ERR wrong number of arguments for 'PUBLISH' command");
                         return;
                     }
+                    tracing::debug!(channel = %String::from_utf8_lossy(args[1]), "PUBLISH");
                     let count = ctx.broadcaster.publish(args[1], args[2]);
                     resp_write_integer(buf, count as i64);
                     return;
@@ -1639,6 +1683,7 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                         resp_write_error(buf, b"ERR wrong number of arguments for 'HSET' command");
                         return;
                     }
+                    tracing::debug!(key = %String::from_utf8_lossy(args[1]), field = %String::from_utf8_lossy(args[2]), "HSET");
                     match ctx.storage.hset(args[1], args[2].to_vec(), args[3].to_vec()) {
                         Ok(_) => buf.put_slice(RESP_ONE),
                         Err(e) => {
@@ -1652,6 +1697,7 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                         resp_write_error(buf, b"ERR wrong number of arguments for 'HGET' command");
                         return;
                     }
+                    tracing::debug!(key = %String::from_utf8_lossy(args[1]), field = %String::from_utf8_lossy(args[2]), "HGET");
                     match ctx.storage.hget(args[1], args[2]) {
                         Ok(Some(v)) => resp_write_bulk_string(buf, &v),
                         Ok(None) => buf.put_slice(RESP_NULL),
@@ -1667,6 +1713,7 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                         return;
                     }
                     let members: Vec<Vec<u8>> = args[2..].iter().map(|a| a.to_vec()).collect();
+                    tracing::debug!(key = %String::from_utf8_lossy(args[1]), member_count = members.len(), "SADD");
                     match ctx.storage.sadd(args[1], members) {
                         Ok(n) => resp_write_integer(buf, n as i64),
                         Err(e) => {
@@ -1682,6 +1729,7 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                     }
                     let start = std::str::from_utf8(args[2]).unwrap_or("0").parse::<i64>().unwrap_or(0);
                     let stop = std::str::from_utf8(args[3]).unwrap_or("-1").parse::<i64>().unwrap_or(-1);
+                    tracing::debug!(key = %String::from_utf8_lossy(args[1]), start, stop, "LRANGE");
                     match ctx.storage.lrange(args[1], start, stop) {
                         Ok(items) => {
                             resp_write_array_header(buf, items.len());
@@ -1702,6 +1750,7 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                         resp_write_error(buf, b"ERR wrong number of arguments for 'SUBSCRIBE' command");
                         return;
                     }
+                    tracing::debug!(channels = ?args[1..].iter().map(|c| String::from_utf8_lossy(c).to_string()).collect::<Vec<_>>(), "SUBSCRIBE");
                     for channel in &args[1..] {
                         let rx = ctx.broadcaster.subscribe_client(ctx.client_id, channel);
                         {
@@ -1712,7 +1761,6 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                             let mut receivers = ctx.pubsub_receivers.write();
                             receivers.push(rx);
                         }
-                        // Write subscribe response
                         resp_write_array_header(buf, 3);
                         resp_write_bulk_string(buf, b"subscribe");
                         resp_write_bulk_string(buf, channel);
@@ -1725,6 +1773,7 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                         resp_write_error(buf, b"ERR wrong number of arguments for 'HGETALL' command");
                         return;
                     }
+                    tracing::debug!(key = %String::from_utf8_lossy(args[1]), "HGETALL");
                     match ctx.storage.hgetall(args[1]) {
                         Ok(pairs) => {
                             resp_write_array_header(buf, pairs.len() * 2);
@@ -1746,6 +1795,7 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                         resp_write_error(buf, b"ERR wrong number of arguments for 'PSUBSCRIBE' command");
                         return;
                     }
+                    tracing::debug!(patterns = ?args[1..].iter().map(|p| String::from_utf8_lossy(p).to_string()).collect::<Vec<_>>(), "PSUBSCRIBE");
                     for pattern in &args[1..] {
                         let rx = ctx.broadcaster.psubscribe_client(ctx.client_id, pattern);
                         {
@@ -1764,6 +1814,7 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                     return;
                 }
                 if cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE") || cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE") {
+                    tracing::debug!(cmd = %String::from_utf8_lossy(cmd), "UNSUBSCRIBE/PUNSUBSCRIBE");
                     for channel in &args[1..] {
                         ctx.broadcaster.unsubscribe(ctx.client_id, channel);
                     }
@@ -1777,6 +1828,7 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                         resp_write_error(buf, b"ERR wrong number of arguments");
                         return;
                     }
+                    tracing::debug!(key = %String::from_utf8_lossy(args[1]), member = %String::from_utf8_lossy(args[2]), "SISMEMBER");
                     match ctx.storage.sismember(args[1], args[2]) {
                         Ok(true) => buf.put_slice(RESP_ONE),
                         Ok(false) => buf.put_slice(RESP_ZERO),
@@ -1791,6 +1843,7 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                         resp_write_error(buf, b"ERR wrong number of arguments");
                         return;
                     }
+                    tracing::debug!(key = %String::from_utf8_lossy(args[1]), "SMEMBERS");
                     match ctx.storage.smembers(args[1]) {
                         Ok(members) => {
                             resp_write_array_header(buf, members.len());
@@ -1809,6 +1862,7 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
         }
 
         // Fallback to string-based command processor for less common commands
+        tracing::debug!(cmd = %String::from_utf8_lossy(cmd), args_count = args.len(), "FALLBACK -> process_command");
         let args_str: Vec<String> = args.iter().map(|a| {
             match std::str::from_utf8(a) {
                 Ok(s) => s.to_owned(),
@@ -1871,40 +1925,35 @@ fn find_crlf(buf: &[u8]) -> Option<usize> {
     }
 }
 
-const MAX_RESP_ARGS: usize = 16;
+const MAX_RESP_ARGS: usize = 512;
 
 struct ZeroCopyArgs<'a> {
-    buf: [&'a [u8]; MAX_RESP_ARGS],
-    len: usize,
+    buf: Vec<&'a [u8]>,
 }
 
 impl<'a> ZeroCopyArgs<'a> {
-    #[inline(always)]
-    fn new() -> Self {
+    fn with_capacity(cap: usize) -> Self {
         ZeroCopyArgs {
-            buf: [b""; MAX_RESP_ARGS],
-            len: 0,
+            buf: Vec::with_capacity(cap.min(MAX_RESP_ARGS)),
         }
     }
 
     #[inline(always)]
     fn push(&mut self, slice: &'a [u8]) {
-        if self.len < MAX_RESP_ARGS {
-            self.buf[self.len] = slice;
-            self.len += 1;
+        if self.buf.len() < MAX_RESP_ARGS {
+            self.buf.push(slice);
         }
     }
 
     #[inline(always)]
     fn as_slice(&self) -> &[&'a [u8]] {
-        &self.buf[..self.len]
+        &self.buf
     }
 
     #[inline(always)]
     fn is_empty(&self) -> bool {
-        self.len == 0
+        self.buf.is_empty()
     }
-
 }
 
 /// Zero-copy RESP frame parser. Returns byte slices pointing into the original buffer.
@@ -1924,7 +1973,7 @@ fn try_parse_resp_frame_zero_copy<'a>(buf: &'a [u8]) -> Option<(usize, ZeroCopyA
     }
 
     let mut pos = first_end + 2;
-    let mut args = ZeroCopyArgs::new();
+    let mut args = ZeroCopyArgs::with_capacity(count);
 
     for _ in 0..count {
         if pos >= buf.len() || buf[pos] != b'$' {
