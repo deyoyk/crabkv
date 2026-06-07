@@ -1,1 +1,9 @@
 /target
+*.exe
+*.log
+*.tmp
+/data
+*.pem
+*.key
+server_out.txt
+server_err.txt

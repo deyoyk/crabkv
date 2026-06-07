@@ -1,0 +1,127 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: crabkv-linux-amd64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: crabkv-linux-arm64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            artifact: crabkv-macos-amd64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact: crabkv-macos-arm64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact: crabkv-windows-amd64.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools (Linux ARM64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Rename binary (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cp target/${{ matrix.target }}/release/crabkv ${{ matrix.artifact }}
+          chmod +x ${{ matrix.artifact }}
+
+      - name: Rename binary (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          Copy-Item "target/${{ matrix.target }}/release/crabkv.exe" "${{ matrix.artifact }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package Linux amd64
+        run: |
+          cd artifacts/crabkv-linux-amd64
+          tar czf ../../crabkv-linux-amd64.tar.gz crabkv-linux-amd64
+          cd ../..
+
+      - name: Package Linux arm64
+        run: |
+          cd artifacts/crabkv-linux-arm64
+          tar czf ../../crabkv-linux-arm64.tar.gz crabkv-linux-arm64
+          cd ../..
+
+      - name: Package macOS amd64
+        run: |
+          cd artifacts/crabkv-macos-amd64
+          tar czf ../../crabkv-macos-amd64.tar.gz crabkv-macos-amd64
+          cd ../..
+
+      - name: Package macOS arm64
+        run: |
+          cd artifacts/crabkv-macos-arm64
+          tar czf ../../crabkv-macos-arm64.tar.gz crabkv-macos-arm64
+          cd ../..
+
+      - name: Package Windows
+        run: |
+          cd artifacts/crabkv-windows-amd64
+          7z a ../../crabkv-windows-amd64.zip crabkv-windows-amd64.exe
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: CrabKV ${{ github.event.inputs.tag || github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            crabkv-linux-amd64.tar.gz
+            crabkv-linux-arm64.tar.gz
+            crabkv-macos-amd64.tar.gz
+            crabkv-macos-arm64.tar.gz
+            crabkv-windows-amd64.zip

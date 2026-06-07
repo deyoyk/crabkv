@@ -1,10 +1,17 @@
 fn main() {
-    // Enable SIMD optimizations where available
     println!("cargo:rerun-if-changed=src/");
-    
-    // Set optimization flags for release builds
+
     #[cfg(not(debug_assertions))]
     {
-        println!("cargo:rustc-link-arg=-Wl,--gc-sections");
+        let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+        match target_os.as_str() {
+            "linux" | "android" => {
+                println!("cargo:rustc-link-arg=-Wl,--gc-sections");
+            }
+            "macos" | "ios" => {
+                println!("cargo:rustc-link-arg=-Wl,-dead_strip");
+            }
+            _ => {}
+        }
     }
 }
