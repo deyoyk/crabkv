@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ahash::{AHashMap, AHashSet, AHasher};
+use bytes::Bytes;
 use crossbeam_skiplist::SkipSet;
 use crossbeam_utils::CachePadded;
 use parking_lot::RwLock;
@@ -21,7 +22,7 @@ const LFU_DECAY_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Debug, PartialEq)]
 pub enum StorageValue {
-    String(Vec<u8>),
+    String(Bytes),
     List(VecDeque<Vec<u8>>),
     Hash(AHashMap<Vec<u8>, Vec<u8>>),
     Set(AHashSet<Vec<u8>>),
@@ -437,8 +438,9 @@ impl StorageEngine {
 
         if shard.is_expired(key) {
             let result = amount;
-            let new_bytes = result.to_string().into_bytes();
-            let new_val = StorageValue::String(new_bytes);
+            let mut itoa_buf = itoa::Buffer::new();
+            let new_bytes = itoa_buf.format(result).as_bytes().to_vec();
+            let new_val = StorageValue::String(Bytes::from(new_bytes));
             let new_size = new_val.memory_usage();
             shard.insert(key.to_vec(), new_val);
             shard.ttl.remove(key);
@@ -458,8 +460,9 @@ impl StorageEngine {
             Some(_) => return Err("wrong type for key".into()),
             None => {
                 let result = amount;
-                let new_bytes = result.to_string().into_bytes();
-                let new_val = StorageValue::String(new_bytes);
+                let mut itoa_buf = itoa::Buffer::new();
+                let new_bytes = itoa_buf.format(result).as_bytes().to_vec();
+                let new_val = StorageValue::String(Bytes::from(new_bytes));
                 let new_size = new_val.memory_usage();
                 shard.insert(key.to_vec(), new_val);
                 drop(shard);
@@ -470,8 +473,9 @@ impl StorageEngine {
         };
 
         let result = current.checked_add(amount).ok_or("increment would overflow")?;
-        let new_bytes = result.to_string().into_bytes();
-        let new_val = StorageValue::String(new_bytes);
+        let mut itoa_buf = itoa::Buffer::new();
+        let new_bytes = itoa_buf.format(result).as_bytes().to_vec();
+        let new_val = StorageValue::String(Bytes::from(new_bytes));
         let old_size = shard.data.get(key).map_or(0, |v| v.memory_usage());
         shard.insert(key.to_vec(), new_val);
         let new_size = shard.data.get(key).map_or(0, |v| v.memory_usage());
@@ -550,10 +554,12 @@ impl StorageEngine {
 
         match shard.data.get_mut(key) {
             Some(StorageValue::String(s)) => {
-                let old_size = s.len();
-                s.extend_from_slice(data);
-                let new_len = s.len();
-                let diff = (new_len as isize) - (old_size as isize);
+                let old_len = s.len();
+                let mut v = s.to_vec();
+                v.extend_from_slice(data);
+                let new_len = v.len();
+                *s = Bytes::from(v);
+                let diff = (new_len as isize) - (old_len as isize);
                 drop(shard);
                 if diff > 0 {
                     self.current_memory
@@ -563,7 +569,7 @@ impl StorageEngine {
             }
             Some(_) => Err("wrong type for key".into()),
             None => {
-                let val = StorageValue::String(data.to_vec());
+                let val = StorageValue::String(Bytes::from(data.to_vec()));
                 let new_size = val.memory_usage();
                 shard.insert(key.to_vec(), val);
                 drop(shard);
@@ -618,12 +624,14 @@ impl StorageEngine {
         match shard.data.get_mut(key) {
             Some(StorageValue::String(s)) => {
                 let old_len = s.len();
+                let mut v = s.to_vec();
                 let needed = offset + data.len();
                 if needed > old_len {
-                    s.resize(needed, 0);
+                    v.resize(needed, 0);
                 }
-                s[offset..offset + data.len()].copy_from_slice(data);
-                let new_len = s.len();
+                v[offset..offset + data.len()].copy_from_slice(data);
+                let new_len = v.len();
+                *s = Bytes::from(v);
                 let diff = (new_len as isize) - (old_len as isize);
                 let final_len = new_len;
                 drop(shard);
@@ -664,18 +672,13 @@ impl StorageEngine {
 
         match shard.data.get_mut(key) {
             Some(StorageValue::List(list)) => {
-                let old_size: usize = list.iter().map(|e| e.len()).sum();
+                let added_bytes: usize = values.iter().map(|v| v.len() + std::mem::size_of::<Vec<u8>>()).sum();
                 for v in values.into_iter().rev() {
                     list.push_front(v);
                 }
-                let new_size: usize = list.iter().map(|e| e.len()).sum();
                 let len = list.len();
-                let diff = (new_size as isize) - (old_size as isize);
                 drop(shard);
-                if diff > 0 {
-                    self.current_memory
-                        .fetch_add(diff as usize, Ordering::Relaxed);
-                }
+                self.current_memory.fetch_add(added_bytes, Ordering::Relaxed);
                 Ok(len)
             }
             Some(_) => Err("wrong type for key".into()),
@@ -704,18 +707,13 @@ impl StorageEngine {
 
         match shard.data.get_mut(key) {
             Some(StorageValue::List(list)) => {
-                let old_size: usize = list.iter().map(|e| e.len()).sum();
+                let added_bytes: usize = values.iter().map(|v| v.len() + std::mem::size_of::<Vec<u8>>()).sum();
                 for v in values {
                     list.push_back(v);
                 }
-                let new_size: usize = list.iter().map(|e| e.len()).sum();
                 let len = list.len();
-                let diff = (new_size as isize) - (old_size as isize);
                 drop(shard);
-                if diff > 0 {
-                    self.current_memory
-                        .fetch_add(diff as usize, Ordering::Relaxed);
-                }
+                self.current_memory.fetch_add(added_bytes, Ordering::Relaxed);
                 Ok(len)
             }
             Some(_) => Err("wrong type for key".into()),
@@ -804,6 +802,17 @@ impl StorageEngine {
         }
     }
 
+    pub fn llen(&self, key: &[u8]) -> usize {
+        let shard = self.get_shard(key).read();
+        if shard.is_expired(key) {
+            return 0;
+        }
+        match shard.data.get(key) {
+            Some(StorageValue::List(list)) => list.len(),
+            _ => 0,
+        }
+    }
+
     pub fn lindex(&self, key: &[u8], index: i64) -> Result<Option<Vec<u8>>, String> {
         let shard = self.get_shard(key).read();
         if shard.is_expired(key) {
@@ -875,8 +884,8 @@ impl StorageEngine {
         match shard.data.get_mut(key) {
             Some(StorageValue::Hash(map)) => {
                 let old_field_val_size = map.get(&field).map_or(0, |v| field.len() + v.len());
-                let existed = map.insert(field.clone(), value.clone()).is_some();
                 let new_field_val_size = field.len() + value.len();
+                let existed = map.insert(field, value).is_some();
                 let diff = (new_field_val_size as isize) - (old_field_val_size as isize);
                 drop(shard);
                 if diff > 0 {
@@ -966,14 +975,16 @@ impl StorageEngine {
         match shard.data.get_mut(key) {
             Some(StorageValue::Set(set)) => {
                 let mut added = 0;
+                let mut added_bytes = 0usize;
                 for m in members {
-                    if set.insert(m.clone()) {
+                    let m_len = m.len() + std::mem::size_of::<Vec<u8>>();
+                    if set.insert(m) {
                         added += 1;
-                        self.current_memory.fetch_add(
-                            m.len() + std::mem::size_of::<Vec<u8>>(),
-                            Ordering::Relaxed,
-                        );
+                        added_bytes += m_len;
                     }
+                }
+                if added_bytes > 0 {
+                    self.current_memory.fetch_add(added_bytes, Ordering::Relaxed);
                 }
                 Ok(added)
             }
@@ -1089,18 +1100,37 @@ impl StorageEngine {
         }
         match shard.data.get(key) {
             Some(StorageValue::SortedSet(data)) => {
-                let items: Vec<(i64, Vec<u8>)> = data.tree.iter().map(|e| e.value().clone()).collect();
-                if items.is_empty() || start >= items.len() {
+                let len = data.tree.len();
+                if len == 0 || start >= len {
                     return Ok(Vec::new());
                 }
-                let end = stop.min(items.len() - 1);
+                let end = stop.min(len - 1);
                 if start > end {
                     return Ok(Vec::new());
                 }
-                Ok(items[start..=end].to_vec())
+                let count = end - start + 1;
+                let items: Vec<(i64, Vec<u8>)> = data.tree.iter()
+                    .skip(start)
+                    .take(count)
+                    .map(|e| e.value().clone())
+                    .collect();
+                Ok(items)
             }
             Some(_) => Err("wrong type for key".into()),
             None => Ok(Vec::new()),
+        }
+    }
+
+    pub fn zlen(&self, key: &[u8]) -> usize {
+        let shard = match self.get_shard(key).read() {
+            shard => shard,
+        };
+        if shard.is_expired(key) {
+            return 0;
+        }
+        match shard.data.get(key) {
+            Some(StorageValue::SortedSet(data)) => data.tree.len(),
+            _ => 0,
         }
     }
 
@@ -1283,7 +1313,7 @@ mod tests {
     fn test_set_get_del() {
         let e = engine();
         let key = b"foo".to_vec();
-        let val = StorageValue::String(b"bar".to_vec());
+        let val = StorageValue::String(b"bar".to_vec().into());
 
         e.set(key.clone(), val.clone());
         assert_eq!(e.get(&key), Some(val.clone()));
@@ -1299,9 +1329,9 @@ mod tests {
     fn test_mget_mset() {
         let e = engine();
         let pairs: Vec<(Vec<u8>, StorageValue)> = vec![
-            (b"a".to_vec(), StorageValue::String(b"1".to_vec())),
-            (b"b".to_vec(), StorageValue::String(b"2".to_vec())),
-            (b"c".to_vec(), StorageValue::String(b"3".to_vec())),
+            (b"a".to_vec(), StorageValue::String(b"1".to_vec().into())),
+            (b"b".to_vec(), StorageValue::String(b"2".to_vec().into())),
+            (b"c".to_vec(), StorageValue::String(b"3".to_vec().into())),
         ];
         e.mset(pairs);
 
@@ -1312,9 +1342,9 @@ mod tests {
             b"d".to_vec(),
         ];
         let results = e.mget(&keys);
-        assert_eq!(results[0], Some(StorageValue::String(b"1".to_vec())));
-        assert_eq!(results[1], Some(StorageValue::String(b"2".to_vec())));
-        assert_eq!(results[2], Some(StorageValue::String(b"3".to_vec())));
+        assert_eq!(results[0], Some(StorageValue::String(b"1".to_vec().into())));
+        assert_eq!(results[1], Some(StorageValue::String(b"2".to_vec().into())));
+        assert_eq!(results[2], Some(StorageValue::String(b"3".to_vec().into())));
         assert_eq!(results[3], None);
     }
 
@@ -1322,7 +1352,7 @@ mod tests {
     fn test_incr_decr() {
         let e = engine();
         let key = b"counter".to_vec();
-        e.set(key.clone(), StorageValue::String(b"10".to_vec()));
+        e.set(key.clone(), StorageValue::String(b"10".to_vec().into()));
 
         assert_eq!(e.incr(&key, 5).unwrap(), 15);
         assert_eq!(e.decr(&key, 3).unwrap(), 12);
@@ -1331,7 +1361,7 @@ mod tests {
 
         e.set(
             key.clone(),
-            StorageValue::String(i64::MAX.to_string().into_bytes()),
+            StorageValue::String(i64::MAX.to_string().into_bytes().into()),
         );
         assert!(e.incr(&key, 1).is_err());
     }
@@ -1340,7 +1370,7 @@ mod tests {
     fn test_ttl_expire_persist() {
         let e = engine();
         let key = b"ttl_key".to_vec();
-        e.set(key.clone(), StorageValue::String(b"v".to_vec()));
+        e.set(key.clone(), StorageValue::String(b"v".to_vec().into()));
 
         assert!(e.ttl(&key).is_none());
         assert!(e.expire(&key, Duration::from_secs(10)));
@@ -1359,7 +1389,7 @@ mod tests {
     fn test_lazy_expiry() {
         let e = engine();
         let key = b"short".to_vec();
-        e.set(key.clone(), StorageValue::String(b"v".to_vec()));
+        e.set(key.clone(), StorageValue::String(b"v".to_vec().into()));
         e.expire(&key, Duration::from_millis(1));
 
         assert!(e.get(&key).is_some());
@@ -1373,7 +1403,7 @@ mod tests {
         let e = engine();
         for i in 0..10 {
             let key = format!("k{}", i).into_bytes();
-            e.set(key.clone(), StorageValue::String(b"v".to_vec()));
+            e.set(key.clone(), StorageValue::String(b"v".to_vec().into()));
             e.expire(&key, Duration::from_millis(1));
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -1386,13 +1416,13 @@ mod tests {
     fn test_append() {
         let e = engine();
         let key = b"app".to_vec();
-        e.set(key.clone(), StorageValue::String(b"hello".to_vec()));
+        e.set(key.clone(), StorageValue::String(b"hello".to_vec().into()));
 
         let new_len = e.append(&key, b" world").unwrap();
         assert_eq!(new_len, 11);
         assert_eq!(
             e.get(&key),
-            Some(StorageValue::String(b"hello world".to_vec()))
+            Some(StorageValue::String(b"hello world".to_vec().into()))
         );
     }
 
@@ -1400,7 +1430,7 @@ mod tests {
     fn test_strlen() {
         let e = engine();
         let key = b"len".to_vec();
-        e.set(key.clone(), StorageValue::String(b"hello".to_vec()));
+        e.set(key.clone(), StorageValue::String(b"hello".to_vec().into()));
         assert_eq!(e.strlen(&key).unwrap(), 5);
 
         assert!(e.strlen(b"noexist").is_err());
@@ -1412,7 +1442,7 @@ mod tests {
         let key = b"range".to_vec();
         e.set(
             key.clone(),
-            StorageValue::String(b"Hello, World!".to_vec()),
+            StorageValue::String(b"Hello, World!".to_vec().into()),
         );
 
         assert_eq!(e.getrange(&key, 0, 4).unwrap(), b"Hello");
@@ -1422,14 +1452,14 @@ mod tests {
         e.setrange(&key, 7, b"Rust").unwrap();
         assert_eq!(
             e.get(&key),
-            Some(StorageValue::String(b"Hello, Rustd!".to_vec()))
+            Some(StorageValue::String(b"Hello, Rustd!".to_vec().into()))
         );
     }
 
     #[test]
     fn test_type_command() {
         let e = engine();
-        e.set(b"s".to_vec(), StorageValue::String(b"".to_vec()));
+        e.set(b"s".to_vec(), StorageValue::String(b"".to_vec().into()));
         e.lpush(b"l", vec![b"1".to_vec()]).unwrap();
         e.hset(b"h", b"f".to_vec(), b"v".to_vec())
             .unwrap();
@@ -1557,7 +1587,7 @@ mod tests {
     #[test]
     fn test_wrong_type_errors() {
         let e = engine();
-        e.set(b"str".to_vec(), StorageValue::String(b"val".to_vec()));
+        e.set(b"str".to_vec(), StorageValue::String(b"val".to_vec().into()));
 
         assert!(e.incr(b"str", 1).is_err());
         assert!(e.lrange(b"str", 0, -1).is_err());
@@ -1573,7 +1603,7 @@ mod tests {
 
         for i in 0..50 {
             let key = format!("key_{}", i).into_bytes();
-            let val = StorageValue::String(vec![b'x'; 50]);
+            let val = StorageValue::String(vec![b'x'; 50].into());
             e.set(key, val);
         }
 
@@ -1583,8 +1613,8 @@ mod tests {
     #[test]
     fn test_random_key() {
         let e = engine();
-        e.set(b"k1".to_vec(), StorageValue::String(b"v".to_vec()));
-        e.set(b"k2".to_vec(), StorageValue::String(b"v".to_vec()));
+        e.set(b"k1".to_vec(), StorageValue::String(b"v".to_vec().into()));
+        e.set(b"k2".to_vec(), StorageValue::String(b"v".to_vec().into()));
 
         let key = e.random_key();
         assert!(key.is_some());
@@ -1595,8 +1625,8 @@ mod tests {
     #[test]
     fn test_flush_all() {
         let e = engine();
-        e.set(b"a".to_vec(), StorageValue::String(b"1".to_vec()));
-        e.set(b"b".to_vec(), StorageValue::String(b"2".to_vec()));
+        e.set(b"a".to_vec(), StorageValue::String(b"1".to_vec().into()));
+        e.set(b"b".to_vec(), StorageValue::String(b"2".to_vec().into()));
         assert_eq!(e.dbsize(), 2);
 
         e.flush_all();
@@ -1610,7 +1640,7 @@ mod tests {
         let key = b"ttlset".to_vec();
         e.set_with_ttl(
             key.clone(),
-            StorageValue::String(b"v".to_vec()),
+            StorageValue::String(b"v".to_vec().into()),
             Duration::from_secs(60),
         );
 
@@ -1624,16 +1654,16 @@ mod tests {
     fn test_overwrite_key() {
         let e = engine();
         let key = b"ow".to_vec();
-        e.set(key.clone(), StorageValue::String(b"first".to_vec()));
+        e.set(key.clone(), StorageValue::String(b"first".to_vec().into()));
         assert_eq!(
             e.get(&key),
-            Some(StorageValue::String(b"first".to_vec()))
+            Some(StorageValue::String(b"first".to_vec().into()))
         );
 
-        e.set(key.clone(), StorageValue::String(b"second".to_vec()));
+        e.set(key.clone(), StorageValue::String(b"second".to_vec().into()));
         assert_eq!(
             e.get(&key),
-            Some(StorageValue::String(b"second".to_vec()))
+            Some(StorageValue::String(b"second".to_vec().into()))
         );
     }
 
@@ -1643,8 +1673,8 @@ mod tests {
         assert_eq!(e.dbsize(), 0);
         assert_eq!(e.memory_usage(), 0);
 
-        e.set(b"a".to_vec(), StorageValue::String(b"hello".to_vec()));
-        e.set(b"b".to_vec(), StorageValue::String(b"world".to_vec()));
+        e.set(b"a".to_vec(), StorageValue::String(b"hello".to_vec().into()));
+        e.set(b"b".to_vec(), StorageValue::String(b"world".to_vec().into()));
         assert_eq!(e.dbsize(), 2);
         assert!(e.memory_usage() > 0);
     }

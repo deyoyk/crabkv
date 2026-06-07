@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use bytes::{BytesMut, BufMut};
+use bytes::{Bytes, BytesMut, BufMut};
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufWriter;
 use tokio::net::{TcpListener, TcpStream};
@@ -15,7 +15,6 @@ const RESP_PONG: &[u8] = b"+PONG\r\n";
 const RESP_NULL: &[u8] = b"$-1\r\n";
 const RESP_ZERO: &[u8] = b":0\r\n";
 const RESP_ONE: &[u8] = b":1\r\n";
-const RESP_EMPTY_ARRAY: &[u8] = b"*0\r\n";
 const RESP_CLOSE: &str = "__CLOSE__";
 
 // Zero-allocation RESP encoding helpers
@@ -99,12 +98,6 @@ struct ServerContext {
 impl ServerContext {
     fn is_subscribed(&self) -> bool {
         !self.subscribed_channels.read().is_empty()
-    }
-
-    fn debug(&self, msg: impl std::fmt::Display) {
-        if self.config.server.debug {
-            tracing::debug!(client_id = self.client_id, "{}", msg);
-        }
     }
 }
 
@@ -370,7 +363,6 @@ impl Server {
             match cmd_bytes {
                 b'P' | b'p' => {
                     if args[0].len() == 4 && args[0].eq_ignore_ascii_case("PING") {
-                        ctx.debug("PING -> PONG");
                         return if args.len() > 1 {
                             format!("+{}\r\n", args[1])
                         } else {
@@ -404,11 +396,10 @@ impl Server {
                                 _ => i += 1,
                             }
                         }
-                        ctx.storage.set(key.to_vec(), StorageValue::String(val.to_vec()));
+                        ctx.storage.set(key.to_vec(), StorageValue::String(Bytes::from(val.to_vec())));
                         if let Some(t) = ttl {
                             ctx.storage.expire(key, t);
                         }
-                        ctx.debug(format!("SET {} = {} (ttl={:?})", String::from_utf8_lossy(key), String::from_utf8_lossy(val), ttl));
                         return "+OK\r\n".into();
                     }
                     if args[0].len() == 3 && args[0].eq_ignore_ascii_case("GET") {
@@ -418,15 +409,12 @@ impl Server {
                         let key = args[1].as_bytes();
                         return match ctx.storage.get(key) {
                             Some(StorageValue::String(s)) => {
-                                ctx.debug(format!("GET {} -> {} bytes", String::from_utf8_lossy(key), s.len()));
                                 format!("${}\r\n{}\r\n", s.len(), String::from_utf8_lossy(&s))
                             }
                             Some(_) => {
-                                ctx.debug(format!("GET {} -> WRONGTYPE", String::from_utf8_lossy(key)));
                                 "-ERR WRONGTYPE Operation against a key\r\n".into()
                             }
                             None => {
-                                ctx.debug(format!("GET {} -> nil", String::from_utf8_lossy(key)));
                                 "$-1\r\n".into()
                             }
                         };
@@ -443,7 +431,6 @@ impl Server {
                                 count += 1;
                             }
                         }
-                        ctx.debug(format!("DEL {:?} -> {}", &args[1..], count));
                         return format!(":{}\r\n", count);
                     }
                 }
@@ -453,11 +440,9 @@ impl Server {
 
         // Slow path: allocate uppercase for less common commands
         let cmd_upper = args[0].to_ascii_uppercase();
-        ctx.debug(format!("command={} args={:?}", cmd_upper, &args[1..]));
 
         match cmd_upper.as_str() {
             "PING" => {
-                ctx.debug("PING -> PONG");
                 if args.len() > 1 {
                     format!("+{}\r\n", args[1])
                 } else {
@@ -465,25 +450,20 @@ impl Server {
                 }
             }
             "ECHO" => {
-                let result = if args.len() < 2 {
+                if args.len() < 2 {
                     "-ERR wrong number of arguments for 'ECHO' command\r\n".into()
                 } else {
                     format!("${}\r\n{}\r\n", args[1].len(), args[1])
-                };
-                ctx.debug(format!("ECHO -> {}", result.len()));
-                result
+                }
             }
             "QUIT" => {
-                ctx.debug("QUIT -> closing connection");
                 "__CLOSE__".into()
             }
             "COMMAND" | "COMMAND DOCS" | "COMMAND COUNT" | "COMMAND INFO" => {
-                ctx.debug(format!("{} -> OK", cmd_upper));
                 "+OK\r\n".into()
             }
             "DBSIZE" => {
                 let size = ctx.storage.dbsize();
-                ctx.debug(format!("DBSIZE -> {}", size));
                 format!(":{}\r\n", size)
             }
             "INFO" => {
@@ -503,7 +483,6 @@ impl Server {
                     }
                     _ => "# Server\r\nredis_version:7.0.0-crabkv\r\n".into(),
                 };
-                ctx.debug(format!("INFO {} -> {} bytes", section, body.len()));
                 format!("${}\r\n{}\r\n", body.len(), body)
             }
             "SET" => {
@@ -531,11 +510,10 @@ impl Server {
                         _ => i += 1,
                     }
                 }
-                ctx.storage.set(key.to_vec(), StorageValue::String(val.to_vec()));
+                ctx.storage.set(key.to_vec(), StorageValue::String(Bytes::from(val.to_vec())));
                 if let Some(t) = ttl {
                     ctx.storage.expire(key, t);
                 }
-                ctx.debug(format!("SET {} = {} (ttl={:?})", String::from_utf8_lossy(key), String::from_utf8_lossy(val), ttl));
                 "+OK\r\n".into()
             }
             "GET" => {
@@ -543,21 +521,17 @@ impl Server {
                     return "-ERR wrong number of arguments for 'GET' command\r\n".into();
                 }
                 let key = args[1].as_bytes();
-                let result = match ctx.storage.get(key) {
+                match ctx.storage.get(key) {
                     Some(StorageValue::String(s)) => {
-                        ctx.debug(format!("GET {} -> {} bytes", String::from_utf8_lossy(key), s.len()));
                         format!("${}\r\n{}\r\n", s.len(), String::from_utf8_lossy(&s))
                     }
                     Some(_) => {
-                        ctx.debug(format!("GET {} -> WRONGTYPE", String::from_utf8_lossy(key)));
                         "-ERR WRONGTYPE Operation against a key\r\n".into()
                     }
                     None => {
-                        ctx.debug(format!("GET {} -> nil", String::from_utf8_lossy(key)));
                         "$-1\r\n".into()
                     }
-                };
-                result
+                }
             }
             "DEL" => {
                 if args.len() < 2 {
@@ -569,7 +543,6 @@ impl Server {
                         count += 1;
                     }
                 }
-                ctx.debug(format!("DEL {:?} -> {}", &args[1..], count));
                 format!(":{}\r\n", count)
             }
             "EXISTS" => {
@@ -582,7 +555,6 @@ impl Server {
                         count += 1;
                     }
                 }
-                ctx.debug(format!("EXISTS {:?} -> {}", &args[1..], count));
                 format!(":{}\r\n", count)
             }
             "SUBSCRIBE" => {
@@ -602,7 +574,6 @@ impl Server {
                         let mut receivers = ctx.pubsub_receivers.write();
                         receivers.push(rx);
                     }
-                    ctx.debug(format!("SUBSCRIBE {} (client={})", String::from_utf8_lossy(channel.as_bytes()), ctx.client_id));
 
                     response.push_str(&format!(
                         "*3\r\n$9\r\nsubscribe\r\n${}\r\n{}\r\n:1\r\n",
@@ -616,7 +587,6 @@ impl Server {
                 for channel in &args[1..] {
                     ctx.broadcaster
                         .unsubscribe(ctx.client_id, channel.as_bytes());
-                    ctx.debug(format!("UNSUBSCRIBE {}", String::from_utf8_lossy(channel.as_bytes())));
                 }
                 "*0\r\n".into()
             }
@@ -627,7 +597,6 @@ impl Server {
                 let count = ctx
                     .broadcaster
                     .publish(args[1].as_bytes(), args[2].as_bytes());
-                ctx.debug(format!("PUBLISH {} -> {} subscribers", String::from_utf8_lossy(args[1].as_bytes()), count));
                 format!(":{}\r\n", count)
             }
             "PSUBSCRIBE" => {
@@ -647,7 +616,6 @@ impl Server {
                         let mut receivers = ctx.pubsub_receivers.write();
                         receivers.push(rx);
                     }
-                    ctx.debug(format!("PSUBSCRIBE {} (client={})", String::from_utf8_lossy(pattern.as_bytes()), ctx.client_id));
 
                     response.push_str(&format!(
                         "*3\r\n$10\r\npsubscribe\r\n${}\r\n{}\r\n:1\r\n",
@@ -661,7 +629,6 @@ impl Server {
                 for pattern in &args[1..] {
                     ctx.broadcaster
                         .unsubscribe(ctx.client_id, pattern.as_bytes());
-                    ctx.debug(format!("PUNSUBSCRIBE {}", String::from_utf8_lossy(pattern.as_bytes())));
                 }
                 "*0\r\n".into()
             }
@@ -672,7 +639,6 @@ impl Server {
                 let key = args[1].as_bytes();
                 let vals: Vec<Vec<u8>> = args[2..].iter().map(|a| a.as_bytes().to_vec()).collect();
                 let result = ctx.storage.lpush(key, vals);
-                ctx.debug(format!("LPUSH {} ({} values) -> {:?}", String::from_utf8_lossy(key), args.len() - 2, result.as_ref().ok()));
                 match result {
                     Ok(n) => format!(":{}\r\n", n),
                     Err(e) => format!("-ERR {}\r\n", e),
@@ -685,7 +651,6 @@ impl Server {
                 let key = args[1].as_bytes();
                 let vals: Vec<Vec<u8>> = args[2..].iter().map(|a| a.as_bytes().to_vec()).collect();
                 let result = ctx.storage.rpush(key, vals);
-                ctx.debug(format!("RPUSH {} ({} values) -> {:?}", String::from_utf8_lossy(key), args.len() - 2, result.as_ref().ok()));
                 match result {
                     Ok(n) => format!(":{}\r\n", n),
                     Err(e) => format!("-ERR {}\r\n", e),
@@ -697,7 +662,6 @@ impl Server {
                 }
                 let key = args[1].as_bytes();
                 let result = ctx.storage.lpop(key);
-                ctx.debug(format!("LPOP {} -> {:?}", String::from_utf8_lossy(key), result.as_ref().ok().and_then(|r| r.as_ref().map(|v| String::from_utf8_lossy(v).to_string()))));
                 match result {
                     Ok(Some(v)) => format!("${}\r\n{}\r\n", v.len(), String::from_utf8_lossy(&v)),
                     Ok(None) => "$-1\r\n".into(),
@@ -710,7 +674,6 @@ impl Server {
                 }
                 let key = args[1].as_bytes();
                 let result = ctx.storage.rpop(key);
-                ctx.debug(format!("RPOP {} -> {:?}", String::from_utf8_lossy(key), result.as_ref().ok().and_then(|r| r.as_ref().map(|v| String::from_utf8_lossy(v).to_string()))));
                 match result {
                     Ok(Some(v)) => format!("${}\r\n{}\r\n", v.len(), String::from_utf8_lossy(&v)),
                     Ok(None) => "$-1\r\n".into(),
@@ -722,12 +685,7 @@ impl Server {
                     return "-ERR wrong number of arguments for 'LLEN' command\r\n".into();
                 }
                 let key = args[1].as_bytes();
-                let result = ctx.storage.lrange(key, 0, -1);
-                ctx.debug(format!("LLEN {} -> {:?}", String::from_utf8_lossy(key), result.as_ref().ok().map(|v| v.len())));
-                match result {
-                    Ok(items) => format!(":{}\r\n", items.len()),
-                    Err(e) => format!("-ERR {}\r\n", e),
-                }
+                format!(":{}\r\n", ctx.storage.llen(key))
             }
             "LRANGE" => {
                 if args.len() < 4 {
@@ -736,7 +694,6 @@ impl Server {
                 let key = args[1].as_bytes();
                 let start = args[2].parse::<i64>().unwrap_or(0);
                 let stop = args[3].parse::<i64>().unwrap_or(-1);
-                ctx.debug(format!("LRANGE {} {} {} -> ...", String::from_utf8_lossy(key), start, stop));
                 match ctx.storage.lrange(key, start, stop) {
                     Ok(items) => {
                         let mut resp = format!("*{}\r\n", items.len());
@@ -755,8 +712,7 @@ impl Server {
                 let key = args[1].as_bytes();
                 let field = args[2].as_bytes().to_vec();
                 let value = args[3].as_bytes().to_vec();
-                let result = ctx.storage.hset(key, field.clone(), value.clone());
-                ctx.debug(format!("HSET {} {} = {} -> {:?}", String::from_utf8_lossy(key), String::from_utf8_lossy(&field), String::from_utf8_lossy(&value), result.as_ref().ok()));
+                let result = ctx.storage.hset(key, field, value);
                 match result {
                     Ok(_) => ":1\r\n".into(),
                     Err(e) => format!("-ERR {}\r\n", e),
@@ -769,7 +725,6 @@ impl Server {
                 let key = args[1].as_bytes();
                 let field = args[2].as_bytes();
                 let result = ctx.storage.hget(key, field);
-                ctx.debug(format!("HGET {} {} -> {:?}", String::from_utf8_lossy(key), String::from_utf8_lossy(field), result.as_ref().ok().and_then(|r| r.as_ref().map(|v| String::from_utf8_lossy(v).to_string()))));
                 match result {
                     Ok(Some(v)) => format!("${}\r\n{}\r\n", v.len(), String::from_utf8_lossy(&v)),
                     Ok(None) => "$-1\r\n".into(),
@@ -782,7 +737,6 @@ impl Server {
                 }
                 let key = args[1].as_bytes();
                 let result = ctx.storage.hgetall(key);
-                ctx.debug(format!("HGETALL {} -> {:?}", String::from_utf8_lossy(key), result.as_ref().ok().map(|v| v.len())));
                 match result {
                     Ok(pairs) => {
                         let mut resp = format!("*{}\r\n", pairs.len() * 2);
@@ -806,7 +760,6 @@ impl Server {
                         count += 1;
                     }
                 }
-                ctx.debug(format!("HDEL {} {:?} -> {}", String::from_utf8_lossy(key), &args[2..], count));
                 format!(":{}\r\n", count)
             }
             "HLEN" => {
@@ -815,7 +768,6 @@ impl Server {
                 }
                 let key = args[1].as_bytes();
                 let result = ctx.storage.hgetall(key);
-                ctx.debug(format!("HLEN {} -> {:?}", String::from_utf8_lossy(key), result.as_ref().ok().map(|v| v.len())));
                 match result {
                     Ok(map) => format!(":{}\r\n", map.len()),
                     Err(e) => format!("-ERR {}\r\n", e),
@@ -828,7 +780,6 @@ impl Server {
                 let key = args[1].as_bytes();
                 let members: Vec<Vec<u8>> = args[2..].iter().map(|a| a.as_bytes().to_vec()).collect();
                 let result = ctx.storage.sadd(key, members);
-                ctx.debug(format!("SADD {} {:?} -> {:?}", String::from_utf8_lossy(key), &args[2..], result.as_ref().ok()));
                 match result {
                     Ok(n) => format!(":{}\r\n", n),
                     Err(e) => format!("-ERR {}\r\n", e),
@@ -840,7 +791,6 @@ impl Server {
                 }
                 let key = args[1].as_bytes();
                 let result = ctx.storage.smembers(key);
-                ctx.debug(format!("SMEMBERS {} -> {:?}", String::from_utf8_lossy(key), result.as_ref().ok().map(|v| v.len())));
                 match result {
                     Ok(members) => {
                         let mut resp = format!("*{}\r\n", members.len());
@@ -863,7 +813,6 @@ impl Server {
                         count += 1;
                     }
                 }
-                ctx.debug(format!("SREM {} {:?} -> {}", String::from_utf8_lossy(key), &args[2..], count));
                 format!(":{}\r\n", count)
             }
             "SCARD" => {
@@ -872,7 +821,6 @@ impl Server {
                 }
                 let key = args[1].as_bytes();
                 let result = ctx.storage.smembers(key);
-                ctx.debug(format!("SCARD {} -> {:?}", String::from_utf8_lossy(key), result.as_ref().ok().map(|v| v.len())));
                 match result {
                     Ok(members) => format!(":{}\r\n", members.len()),
                     Err(e) => format!("-ERR {}\r\n", e),
@@ -885,7 +833,6 @@ impl Server {
                 let key = args[1].as_bytes();
                 let member = args[2].as_bytes();
                 let result = ctx.storage.sismember(key, member);
-                ctx.debug(format!("SISMEMBER {} {} -> {:?}", String::from_utf8_lossy(key), String::from_utf8_lossy(member), result.as_ref().ok()));
                 match result {
                     Ok(true) => ":1\r\n".into(),
                     Ok(false) => ":0\r\n".into(),
@@ -899,8 +846,7 @@ impl Server {
                 let key = args[1].as_bytes();
                 let score: i64 = args[2].parse().unwrap_or(0);
                 let member = args[3].as_bytes().to_vec();
-                let result = ctx.storage.zadd(key, score, member.clone());
-                ctx.debug(format!("ZADD {} {} {} -> {:?}", String::from_utf8_lossy(key), score, String::from_utf8_lossy(&member), result.as_ref().ok()));
+                let result = ctx.storage.zadd(key, score, member);
                 match result {
                     Ok(_) => ":1\r\n".into(),
                     Err(e) => format!("-ERR {}\r\n", e),
@@ -911,16 +857,12 @@ impl Server {
                     return "-ERR wrong number of arguments for 'ZRANGE' command\r\n".into();
                 }
                 let key = args[1].as_bytes();
+                let len = ctx.storage.zlen(key);
                 let start = args[2].parse::<i64>().unwrap_or(0);
                 let stop = args[3].parse::<i64>().unwrap_or(-1);
-                let len = match ctx.storage.zrange(key, 0, 0) {
-                    Ok(_) => 0,
-                    Err(_) => 0,
-                };
                 let actual_start = if start < 0 { (len as i64 + start).max(0) as usize } else { start as usize };
                 let actual_stop = if stop < 0 { (len as i64 + stop).max(0) as usize } else { stop as usize };
                 let withscores = args.get(4).map(|s| s.to_uppercase() == "WITHSCORES").unwrap_or(false);
-                ctx.debug(format!("ZRANGE {} {} {} (withscores={}) -> ...", String::from_utf8_lossy(key), actual_start, actual_stop, withscores));
                 match ctx.storage.zrange(key, actual_start, actual_stop) {
                     Ok(items) => {
                         if withscores {
@@ -948,7 +890,6 @@ impl Server {
                 let key = args[1].as_bytes();
                 let member = args[2].as_bytes();
                 let result = ctx.storage.zscore(key, member);
-                ctx.debug(format!("ZSCORE {} {} -> {:?}", String::from_utf8_lossy(key), String::from_utf8_lossy(member), result.as_ref().ok().and_then(|r| *r)));
                 match result {
                     Ok(Some(score)) => format!(":{}\r\n", score),
                     Ok(None) => "$-1\r\n".into(),
@@ -970,7 +911,6 @@ impl Server {
                                 break;
                             }
                         }
-                        ctx.debug(format!("ZRANK {} {} -> {:?}", String::from_utf8_lossy(key), String::from_utf8_lossy(member), rank));
                         match rank {
                             Some(i) => format!(":{}\r\n", i),
                             None => "$-1\r\n".into(),
@@ -983,7 +923,6 @@ impl Server {
                 if args.len() < 3 {
                     return "-ERR wrong number of arguments for 'ZREM' command\r\n".into();
                 }
-                ctx.debug(format!("ZREM {} {:?} -> 0 (stub)", String::from_utf8_lossy(args[1].as_bytes()), &args[2..]));
                 ":0\r\n".into()
             }
             "ZCARD" => {
@@ -991,12 +930,7 @@ impl Server {
                     return "-ERR wrong number of arguments for 'ZCARD' command\r\n".into();
                 }
                 let key = args[1].as_bytes();
-                let result = ctx.storage.zrange(key, 0, usize::MAX);
-                ctx.debug(format!("ZCARD {} -> {:?}", String::from_utf8_lossy(key), result.as_ref().ok().map(|v| v.len())));
-                match result {
-                    Ok(items) => format!(":{}\r\n", items.len()),
-                    Err(e) => format!("-ERR {}\r\n", e),
-                }
+                format!(":{}\r\n", ctx.storage.zlen(key))
             }
             "INCR" => {
                 if args.len() < 2 {
@@ -1004,7 +938,6 @@ impl Server {
                 }
                 let key = args[1].as_bytes();
                 let result = ctx.storage.incr(key, 1);
-                ctx.debug(format!("INCR {} -> {:?}", String::from_utf8_lossy(key), result.as_ref().ok()));
                 match result {
                     Ok(n) => format!(":{}\r\n", n),
                     Err(e) => format!("-ERR {}\r\n", e),
@@ -1016,7 +949,6 @@ impl Server {
                 }
                 let key = args[1].as_bytes();
                 let result = ctx.storage.incr(key, -1);
-                ctx.debug(format!("DECR {} -> {:?}", String::from_utf8_lossy(key), result.as_ref().ok()));
                 match result {
                     Ok(n) => format!(":{}\r\n", n),
                     Err(e) => format!("-ERR {}\r\n", e),
@@ -1029,7 +961,6 @@ impl Server {
                 let key = args[1].as_bytes();
                 let amount: i64 = args[2].parse().unwrap_or(0);
                 let result = ctx.storage.incr(key, amount);
-                ctx.debug(format!("INCRBY {} {} -> {:?}", String::from_utf8_lossy(key), amount, result.as_ref().ok()));
                 match result {
                     Ok(n) => format!(":{}\r\n", n),
                     Err(e) => format!("-ERR {}\r\n", e),
@@ -1042,7 +973,6 @@ impl Server {
                 let key = args[1].as_bytes();
                 let amount: i64 = args[2].parse().unwrap_or(0);
                 let result = ctx.storage.incr(key, -amount);
-                ctx.debug(format!("DECRBY {} {} -> {:?}", String::from_utf8_lossy(key), amount, result.as_ref().ok()));
                 match result {
                     Ok(n) => format!(":{}\r\n", n),
                     Err(e) => format!("-ERR {}\r\n", e),
@@ -1055,7 +985,6 @@ impl Server {
                 let key = args[1].as_bytes();
                 let secs: u64 = args[2].parse().unwrap_or(0);
                 let result = ctx.storage.expire(key, std::time::Duration::from_secs(secs));
-                ctx.debug(format!("EXPIRE {} {} -> {}", String::from_utf8_lossy(key), secs, result));
                 if result { ":1\r\n".into() } else { ":0\r\n".into() }
             }
             "TTL" => {
@@ -1064,7 +993,6 @@ impl Server {
                 }
                 let key = args[1].as_bytes();
                 let result = ctx.storage.ttl(key);
-                ctx.debug(format!("TTL {} -> {:?}", String::from_utf8_lossy(key), result));
                 match result {
                     Some(d) => format!(":{}\r\n", d.as_secs()),
                     None => ":-2\r\n".into(),
@@ -1076,11 +1004,9 @@ impl Server {
                 }
                 let key = args[1].as_bytes();
                 let result = ctx.storage.persist(key);
-                ctx.debug(format!("PERSIST {} -> {}", String::from_utf8_lossy(key), result));
                 if result { ":1\r\n".into() } else { ":0\r\n".into() }
             }
             "KEYS" => {
-                ctx.debug("KEYS -> *0 (stub)");
                 "*0\r\n".into()
             }
             "TYPE" => {
@@ -1089,30 +1015,25 @@ impl Server {
                 }
                 let key = args[1].as_bytes();
                 let result = ctx.storage.r#type(key);
-                ctx.debug(format!("TYPE {} -> {:?}", String::from_utf8_lossy(key), result));
                 match result {
                     Some(dt) => format!("+{:?}\r\n", dt).to_lowercase().into(),
                     None => "+none\r\n".into(),
                 }
             }
             "FLUSHDB" | "FLUSHALL" => {
-                ctx.debug(format!("{} -> OK", cmd_upper));
                 ctx.storage.flush_all();
                 "+OK\r\n".into()
             },
             "SAVE" | "BGSAVE" => {
-ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                 "+OK\r\n".into()
             }
             "LASTSAVE" => {
-                ctx.debug("LASTSAVE -> 0");
                 ":0\r\n".into()
             }
             "TIME" => {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default();
-                ctx.debug(format!("TIME -> {}.{:06}", now.as_secs(), now.subsec_micros()));
                 format!("*2\r\n:{}\r\n:{}\r\n", now.as_secs(), now.subsec_micros())
             }
             "CLIENT" => {
@@ -1121,23 +1042,18 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                 }
                 match args[1].to_uppercase().as_str() {
                     "ID" => {
-                        ctx.debug(format!("CLIENT ID -> {}", ctx.client_id));
                         format!(":{}\r\n", ctx.client_id)
                     }
                     "LIST" => {
-                        ctx.debug("CLIENT LIST -> OK (stub)");
                         "+OK\r\n".into()
                     }
                     "SETNAME" => {
-                        ctx.debug("CLIENT SETNAME -> OK (stub)");
                         "+OK\r\n".into()
                     }
                     "GETNAME" => {
-                        ctx.debug("CLIENT GETNAME -> nil (stub)");
                         "$-1\r\n".into()
                     }
-                    sub => {
-                        ctx.debug(format!("CLIENT {} -> ERR unknown subcommand", sub));
+                    _ => {
                         "-ERR unknown CLIENT subcommand\r\n".into()
                     }
                 }
@@ -1148,22 +1064,18 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                 }
                 match args[1].to_uppercase().as_str() {
                     "GET" => {
-                        ctx.debug("CONFIG GET -> *0 (stub)");
                         "*0\r\n".into()
                     }
                     "SET" => {
-                        ctx.debug("CONFIG SET -> OK (stub)");
                         "+OK\r\n".into()
                     }
-                    sub => {
-                        ctx.debug(format!("CONFIG {} -> ERR unknown subcommand", sub));
+                    _ => {
                         "-ERR unknown CONFIG subcommand\r\n".into()
                     }
                 }
             }
             "CLUSTER" => {
                 if !ctx.config.cluster.enabled {
-                    ctx.debug("CLUSTER -> ERR not enabled");
                     return "-ERR cluster mode is not enabled\r\n".into();
                 }
                 if args.len() < 2 {
@@ -1171,15 +1083,12 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                 }
                 match args[1].to_uppercase().as_str() {
                     "INFO" => {
-                        ctx.debug("CLUSTER INFO -> OK (stub)");
                         "+cluster_enabled:1\r\n".into()
                     }
                     "NODES" => {
-                        ctx.debug("CLUSTER NODES -> OK (stub)");
                         "+OK\r\n".into()
                     }
-                    sub => {
-                        ctx.debug(format!("CLUSTER {} -> ERR unknown subcommand", sub));
+                    _ => {
                         "-ERR unknown CLUSTER subcommand\r\n".into()
                     }
                 }
@@ -1191,7 +1100,6 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                 let key = args[1].as_bytes();
                 let mut fields = ahash::AHashMap::new();
                 let mut i = 2;
-                // Skip the ID argument (use "*" for auto-generation)
                 if args.len() > 3 && args[2] == "*" {
                     i = 3;
                 }
@@ -1200,7 +1108,6 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                     i += 2;
                 }
                 let result = ctx.storage.xadd(key, fields);
-                ctx.debug(format!("XADD {} -> {:?}", String::from_utf8_lossy(key), result.as_ref().ok()));
                 match result {
                     Ok(id) => format!(":{}\r\n", id),
                     Err(e) => format!("-ERR {}\r\n", e),
@@ -1212,7 +1119,6 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                 }
                 let key = args[1].as_bytes();
                 let result = ctx.storage.xrange(key, 0, u64::MAX);
-                ctx.debug(format!("XLEN {} -> {:?}", String::from_utf8_lossy(key), result.as_ref().ok().map(|v| v.len())));
                 match result {
                     Ok(entries) => format!(":{}\r\n", entries.len()),
                     Err(e) => format!("-ERR {}\r\n", e),
@@ -1225,7 +1131,6 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                 let key = args[1].as_bytes();
                 let start: u64 = args[2].parse().unwrap_or(0);
                 let end: u64 = args[3].parse().unwrap_or(u64::MAX);
-                ctx.debug(format!("XRANGE {} {} {} -> ...", String::from_utf8_lossy(key), start, end));
                 match ctx.storage.xrange(key, start, end) {
                     Ok(entries) => {
                         let mut resp = format!("*{}\r\n", entries.len());
@@ -1246,7 +1151,6 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                 }
             }
             "XREAD" => {
-                // XREAD [COUNT count] STREAMS key [key ...] id [id ...]
                 let mut count = 10;
                 let mut stream_idx = 1;
                 if args.len() > 3 && args[1].to_uppercase() == "COUNT" {
@@ -1256,11 +1160,8 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                     stream_idx = 3;
                 }
                 if stream_idx >= args.len() {
-                    ctx.debug("XREAD -> *0 (no streams)");
                     return "*0\r\n".into();
                 }
-                let keys: Vec<_> = args[stream_idx..].iter().map(|a| String::from_utf8_lossy(a.as_bytes()).to_string()).collect();
-                ctx.debug(format!("XREAD count={} streams={:?}", count, keys));
                 let mut resp = String::new();
                 let mut found_any = false;
                 for i in stream_idx..args.len() {
@@ -1290,35 +1191,27 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                 if args.len() < 3 {
                     return "-ERR wrong number of arguments for 'XACK' command\r\n".into();
                 }
-                ctx.debug(format!("XACK {} {} -> 0 (stub)", String::from_utf8_lossy(args[1].as_bytes()), String::from_utf8_lossy(args[2].as_bytes())));
                 ":0\r\n".into()
             }
             "XGROUP" => {
-                ctx.debug(format!("XGROUP -> OK (stub)"));
                 "+OK\r\n".into()
             }
             "XINFO" => {
-                ctx.debug(format!("XINFO -> OK (stub)"));
                 "+OK\r\n".into()
             }
             "XCLAIM" | "XAUTOCLAIM" => {
-                ctx.debug(format!("{} -> *0 (stub)", cmd_upper));
                 "*0\r\n".into()
             }
             "XTRIM" => {
-                ctx.debug(format!("XTRIM -> 0 (stub)"));
                 ":0\r\n".into()
             }
             "XDEL" => {
-                ctx.debug(format!("XDEL -> 0 (stub)"));
                 ":0\r\n".into()
             }
             "XCREATE" => {
-                ctx.debug(format!("XCREATE -> OK (stub)"));
                 "+OK\r\n".into()
             }
             "XQUEUE" => {
-                ctx.debug(format!("XQUEUE -> *0 (stub)"));
                 "*0\r\n".into()
             }
             "JOBADD" => {
@@ -1329,7 +1222,6 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                 let payload = args[2].as_bytes().to_vec();
                 let priority: i32 = args[3].parse().unwrap_or(0);
                 let id = ctx.jobs.add_job(&queue, payload, priority, None);
-                ctx.debug(format!("JOBADD {} priority={} -> {}", queue, priority, id));
                 format!("+{}\r\n", id)
             }
             "JOBPOP" => {
@@ -1338,7 +1230,6 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                 }
                 let queue = args[1].as_str();
                 let result = ctx.jobs.pop_job(&queue);
-                ctx.debug(format!("JOBPOP {} -> {:?}", queue, result.as_ref().map(|j| &j.id)));
                 match result {
                     Some(job) => {
                         let payload = String::from_utf8_lossy(&job.payload).to_string();
@@ -1360,7 +1251,6 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                     return "-ERR wrong number of arguments for 'JOBACK' command\r\n".into();
                 }
                 let result = ctx.jobs.ack_job(&args[1], &args[2]);
-                ctx.debug(format!("JOBACK {} {} -> {}", args[1], args[2], result));
                 if result { "+OK\r\n".into() } else { "-ERR job not found\r\n".into() }
             }
             "JOBFAIL" => {
@@ -1368,7 +1258,6 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                     return "-ERR wrong number of arguments for 'JOBFAIL' command\r\n".into();
                 }
                 let result = ctx.jobs.fail_job(&args[1], &args[2], &args[3]);
-                ctx.debug(format!("JOBFAIL {} {} -> {}", args[1], args[2], result));
                 if result { "+OK\r\n".into() } else { "-ERR job not found\r\n".into() }
             }
             "JOBRETRY" => {
@@ -1376,7 +1265,6 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                     return "-ERR wrong number of arguments for 'JOBRETRY' command\r\n".into();
                 }
                 let result = ctx.jobs.retry_job(&args[1], &args[2]);
-                ctx.debug(format!("JOBRETRY {} {} -> {}", args[1], args[2], result));
                 if result { "+OK\r\n".into() } else { "-ERR job not found\r\n".into() }
             }
             "JOBSTATS" => {
@@ -1385,7 +1273,6 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                 }
                 let queue = args[1].as_str();
                 let (pending, processing, dead) = ctx.jobs.queue_stats(&queue);
-                ctx.debug(format!("JOBSTATS {} -> pending={}, processing={}, dead={}", queue, pending, processing, dead));
                 format!("*3\r\n:{}\r\n:{}\r\n:{}\r\n", pending, processing, dead)
             }
             "JOBDEAD" => {
@@ -1394,7 +1281,6 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                 }
                 let queue = args[1].as_str();
                 let letters = ctx.jobs.get_dead_letters(&queue);
-                ctx.debug(format!("JOBDEAD {} -> {} dead letters", queue, letters.len()));
                 if letters.is_empty() {
                     "*0\r\n".into()
                 } else {
@@ -1402,22 +1288,18 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                 }
             }
             "XWORKERS" => {
-                ctx.debug("XWORKERS -> *0 (stub)");
                 "*0\r\n".into()
             }
             "XREPLY" => {
                 if args.len() < 3 {
                     return "-ERR wrong number of arguments for 'XREPLY' command\r\n".into();
                 }
-                ctx.debug(format!("XREPLY {} {} -> OK (stub)", String::from_utf8_lossy(args[1].as_bytes()), String::from_utf8_lossy(args[2].as_bytes())));
                 "+OK\r\n".into()
             }
             "XWATCH" => {
-                ctx.debug("XWATCH -> *0 (stub)");
                 "*0\r\n".into()
             }
             _ => {
-                ctx.debug(format!("{} -> ERR unknown command", args[0]));
                 format!("-ERR unknown command '{}'\r\n", args[0])
             }
         }
@@ -1462,8 +1344,7 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                             i += 1;
                         }
                     }
-                    tracing::debug!(key = %String::from_utf8_lossy(key), val_len = val.len(), ?ttl, "SET");
-                    ctx.storage.set(key.to_vec(), StorageValue::String(val.to_vec()));
+                    ctx.storage.set(key.to_vec(), StorageValue::String(Bytes::from(val.to_vec())));
                     if let Some(t) = ttl {
                         ctx.storage.expire(key, t);
                     }
@@ -1475,7 +1356,6 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                         resp_write_error(buf, b"ERR wrong number of arguments for 'GET' command");
                         return;
                     }
-                    tracing::debug!(key = %String::from_utf8_lossy(args[1]), "GET");
                     match ctx.storage.get(args[1]) {
                         Some(StorageValue::String(s)) => {
                             resp_write_bulk_string(buf, &s);
@@ -1494,7 +1374,6 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                         resp_write_error(buf, b"ERR wrong number of arguments for 'DEL' command");
                         return;
                     }
-                    tracing::debug!(keys = ?args[1..].iter().map(|k| String::from_utf8_lossy(k).to_string()).collect::<Vec<_>>(), "DEL");
                     let mut count = 0u64;
                     for key in &args[1..] {
                         if ctx.storage.del(key) {
@@ -1507,7 +1386,6 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
             }
             4 => {
                 if cmd.eq_ignore_ascii_case(b"PING") {
-                    tracing::debug!("PING");
                     if args.len() > 1 {
                         resp_write_simple_string(buf, args[1]);
                     } else {
@@ -1516,7 +1394,6 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                     return;
                 }
                 if cmd.eq_ignore_ascii_case(b"ECHO") {
-                    tracing::debug!("ECHO");
                     if args.len() < 2 {
                         resp_write_error(buf, b"ERR wrong number of arguments for 'ECHO' command");
                         return;
@@ -1525,7 +1402,6 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                     return;
                 }
                 if cmd.eq_ignore_ascii_case(b"QUIT") {
-                    tracing::debug!("QUIT");
                     buf.put_slice(b"__CLOSE__");
                     return;
                 }
@@ -1535,7 +1411,6 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                         return;
                     }
                     let amount = if cmd[0] == b'I' || cmd[0] == b'i' { 1 } else { -1 };
-                    tracing::debug!(key = %String::from_utf8_lossy(args[1]), amount, "INCR/DECR");
                     match ctx.storage.incr(args[1], amount) {
                         Ok(n) => resp_write_integer(buf, n),
                         Err(e) => {
@@ -1544,22 +1419,69 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                     }
                     return;
                 }
+                if cmd.eq_ignore_ascii_case(b"ZADD") {
+                    if args.len() < 4 {
+                        resp_write_error(buf, b"ERR wrong number of arguments for 'ZADD' command");
+                        return;
+                    }
+                    if let Some(score) = std::str::from_utf8(args[2]).ok().and_then(|s| s.parse::<i64>().ok()) {
+                        match ctx.storage.zadd(args[1], score, args[3].to_vec()) {
+                            Ok(_) => buf.put_slice(RESP_ONE),
+                            Err(e) => resp_write_error(buf, e.as_bytes()),
+                        }
+                    } else {
+                        resp_write_error(buf, b"ERR score is not a valid integer");
+                    }
+                    return;
+                }
+                if cmd.eq_ignore_ascii_case(b"ZRANGE") {
+                    if args.len() < 4 {
+                        resp_write_error(buf, b"ERR wrong number of arguments for 'ZRANGE' command");
+                        return;
+                    }
+                    let len = ctx.storage.zlen(args[1]);
+                    let start_raw = std::str::from_utf8(args[2]).unwrap_or("0").parse::<i64>().unwrap_or(0);
+                    let stop_raw = std::str::from_utf8(args[3]).unwrap_or("-1").parse::<i64>().unwrap_or(-1);
+                    let actual_start = if start_raw < 0 { (len as i64 + start_raw).max(0) as usize } else { start_raw as usize };
+                    let actual_stop = if stop_raw < 0 { (len as i64 + stop_raw).max(0) as usize } else { stop_raw as usize };
+                    let withscores = args.get(4).map(|s| s.eq_ignore_ascii_case(b"WITHSCORES")).unwrap_or(false);
+                    match ctx.storage.zrange(args[1], actual_start, actual_stop) {
+                        Ok(items) => {
+                            if withscores {
+                                resp_write_array_header(buf, items.len() * 2);
+                                for (score, member) in &items {
+                                    resp_write_bulk_string(buf, member);
+                                    let mut itoa_buf = itoa::Buffer::new();
+                                    let s = itoa_buf.format(*score);
+                                    buf.put_slice(b":");
+                                    buf.put_slice(s.as_bytes());
+                                    buf.put_slice(b"\r\n");
+                                }
+                            } else {
+                                resp_write_array_header(buf, items.len());
+                                for (_score, member) in &items {
+                                    resp_write_bulk_string(buf, member);
+                                }
+                            }
+                        }
+                        Err(e) => resp_write_error(buf, e.as_bytes()),
+                    }
+                    return;
+                }
                 if cmd.eq_ignore_ascii_case(b"MSET") {
-                    tracing::debug!(pair_count = (args.len() - 1) / 2, "MSET");
                     if args.len() < 3 || (args.len() - 1) % 2 != 0 {
                         resp_write_error(buf, b"ERR wrong number of arguments for 'MSET' command");
                         return;
                     }
                     let mut i = 1;
                     while i + 1 < args.len() {
-                        ctx.storage.set(args[i].to_vec(), StorageValue::String(args[i + 1].to_vec()));
+                        ctx.storage.set(args[i].to_vec(), StorageValue::String(Bytes::from(args[i + 1].to_vec())));
                         i += 2;
                     }
                     buf.put_slice(RESP_OK);
                     return;
                 }
                 if cmd.eq_ignore_ascii_case(b"MGET") {
-                    tracing::debug!(key_count = args.len() - 1, "MGET");
                     if args.len() < 2 {
                         resp_write_error(buf, b"ERR wrong number of arguments for 'MGET' command");
                         return;
@@ -1581,7 +1503,6 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                         resp_write_error(buf, b"ERR wrong number of arguments");
                         return;
                     }
-                    tracing::debug!(keys = ?args[1..].iter().map(|k| String::from_utf8_lossy(k).to_string()).collect::<Vec<_>>(), "EXISTS");
                     let mut count = 0u64;
                     for key in &args[1..] {
                         if ctx.storage.exists(key) {
@@ -1594,7 +1515,6 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
             }
             6 => {
                 if cmd.eq_ignore_ascii_case(b"DBSIZE") {
-                    tracing::debug!("DBSIZE");
                     resp_write_integer(buf, ctx.storage.dbsize() as i64);
                     return;
                 }
@@ -1607,13 +1527,20 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                         .map(|s| s.parse().unwrap_or(0))
                         .unwrap_or(0);
                     let amount = if cmd[0] == b'I' || cmd[0] == b'i' { amount } else { -amount };
-                    tracing::debug!(key = %String::from_utf8_lossy(args[1]), amount, "INCRBY/DECRBY");
                     match ctx.storage.incr(args[1], amount) {
                         Ok(n) => resp_write_integer(buf, n),
                         Err(e) => {
                             resp_write_error(buf, e.as_bytes());
                         }
                     }
+                    return;
+                }
+                if cmd.eq_ignore_ascii_case(b"ZCARD") {
+                    if args.len() < 2 {
+                        resp_write_error(buf, b"ERR wrong number of arguments");
+                        return;
+                    }
+                    resp_write_integer(buf, ctx.storage.zlen(args[1]) as i64);
                     return;
                 }
             }
@@ -1624,7 +1551,6 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                         return;
                     }
                     let vals: Vec<Vec<u8>> = args[2..].iter().map(|a| a.to_vec()).collect();
-                    tracing::debug!(key = %String::from_utf8_lossy(args[1]), count = vals.len(), cmd = %String::from_utf8_lossy(cmd), "LPUSH/RPUSH");
                     let result = if cmd[0] == b'L' || cmd[0] == b'l' {
                         ctx.storage.lpush(args[1], vals)
                     } else {
@@ -1639,7 +1565,6 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                     return;
                 }
                 if cmd.eq_ignore_ascii_case(b"FLUSHALL") || cmd.eq_ignore_ascii_case(b"FLUSHDB") {
-                    tracing::debug!("FLUSHALL/FLUSHDB");
                     ctx.storage.flush_all();
                     buf.put_slice(RESP_OK);
                     return;
@@ -1651,7 +1576,6 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                         resp_write_error(buf, b"ERR wrong number of arguments");
                         return;
                     }
-                    tracing::debug!(key = %String::from_utf8_lossy(args[1]), cmd = %String::from_utf8_lossy(cmd), "LPOP/RPOP");
                     let result = if cmd[0] == b'L' || cmd[0] == b'l' {
                         ctx.storage.lpop(args[1])
                     } else {
@@ -1671,9 +1595,16 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                         resp_write_error(buf, b"ERR wrong number of arguments for 'PUBLISH' command");
                         return;
                     }
-                    tracing::debug!(channel = %String::from_utf8_lossy(args[1]), "PUBLISH");
                     let count = ctx.broadcaster.publish(args[1], args[2]);
                     resp_write_integer(buf, count as i64);
+                    return;
+                }
+                if cmd.eq_ignore_ascii_case(b"LLEN") {
+                    if args.len() < 2 {
+                        resp_write_error(buf, b"ERR wrong number of arguments");
+                        return;
+                    }
+                    resp_write_integer(buf, ctx.storage.llen(args[1]) as i64);
                     return;
                 }
             }
@@ -1683,7 +1614,6 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                         resp_write_error(buf, b"ERR wrong number of arguments for 'HSET' command");
                         return;
                     }
-                    tracing::debug!(key = %String::from_utf8_lossy(args[1]), field = %String::from_utf8_lossy(args[2]), "HSET");
                     match ctx.storage.hset(args[1], args[2].to_vec(), args[3].to_vec()) {
                         Ok(_) => buf.put_slice(RESP_ONE),
                         Err(e) => {
@@ -1697,7 +1627,6 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                         resp_write_error(buf, b"ERR wrong number of arguments for 'HGET' command");
                         return;
                     }
-                    tracing::debug!(key = %String::from_utf8_lossy(args[1]), field = %String::from_utf8_lossy(args[2]), "HGET");
                     match ctx.storage.hget(args[1], args[2]) {
                         Ok(Some(v)) => resp_write_bulk_string(buf, &v),
                         Ok(None) => buf.put_slice(RESP_NULL),
@@ -1713,7 +1642,6 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                         return;
                     }
                     let members: Vec<Vec<u8>> = args[2..].iter().map(|a| a.to_vec()).collect();
-                    tracing::debug!(key = %String::from_utf8_lossy(args[1]), member_count = members.len(), "SADD");
                     match ctx.storage.sadd(args[1], members) {
                         Ok(n) => resp_write_integer(buf, n as i64),
                         Err(e) => {
@@ -1729,7 +1657,6 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                     }
                     let start = std::str::from_utf8(args[2]).unwrap_or("0").parse::<i64>().unwrap_or(0);
                     let stop = std::str::from_utf8(args[3]).unwrap_or("-1").parse::<i64>().unwrap_or(-1);
-                    tracing::debug!(key = %String::from_utf8_lossy(args[1]), start, stop, "LRANGE");
                     match ctx.storage.lrange(args[1], start, stop) {
                         Ok(items) => {
                             resp_write_array_header(buf, items.len());
@@ -1745,35 +1672,11 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                 }
             }
             10 => {
-                if cmd.eq_ignore_ascii_case(b"SUBSCRIBE") {
-                    if args.len() < 2 {
-                        resp_write_error(buf, b"ERR wrong number of arguments for 'SUBSCRIBE' command");
-                        return;
-                    }
-                    tracing::debug!(channels = ?args[1..].iter().map(|c| String::from_utf8_lossy(c).to_string()).collect::<Vec<_>>(), "SUBSCRIBE");
-                    for channel in &args[1..] {
-                        let rx = ctx.broadcaster.subscribe_client(ctx.client_id, channel);
-                        {
-                            let mut subs = ctx.subscribed_channels.write();
-                            subs.push(channel.to_vec());
-                        }
-                        {
-                            let mut receivers = ctx.pubsub_receivers.write();
-                            receivers.push(rx);
-                        }
-                        resp_write_array_header(buf, 3);
-                        resp_write_bulk_string(buf, b"subscribe");
-                        resp_write_bulk_string(buf, channel);
-                        resp_write_integer(buf, 1);
-                    }
-                    return;
-                }
                 if cmd.eq_ignore_ascii_case(b"HGETALL") {
                     if args.len() < 2 {
                         resp_write_error(buf, b"ERR wrong number of arguments for 'HGETALL' command");
                         return;
                     }
-                    tracing::debug!(key = %String::from_utf8_lossy(args[1]), "HGETALL");
                     match ctx.storage.hgetall(args[1]) {
                         Ok(pairs) => {
                             resp_write_array_header(buf, pairs.len() * 2);
@@ -1789,46 +1692,12 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                     return;
                 }
             }
-            11 => {
-                if cmd.eq_ignore_ascii_case(b"PSUBSCRIBE") {
-                    if args.len() < 2 {
-                        resp_write_error(buf, b"ERR wrong number of arguments for 'PSUBSCRIBE' command");
-                        return;
-                    }
-                    tracing::debug!(patterns = ?args[1..].iter().map(|p| String::from_utf8_lossy(p).to_string()).collect::<Vec<_>>(), "PSUBSCRIBE");
-                    for pattern in &args[1..] {
-                        let rx = ctx.broadcaster.psubscribe_client(ctx.client_id, pattern);
-                        {
-                            let mut subs = ctx.subscribed_channels.write();
-                            subs.push(pattern.to_vec());
-                        }
-                        {
-                            let mut receivers = ctx.pubsub_receivers.write();
-                            receivers.push(rx);
-                        }
-                        resp_write_array_header(buf, 3);
-                        resp_write_bulk_string(buf, b"psubscribe");
-                        resp_write_bulk_string(buf, pattern);
-                        resp_write_integer(buf, 1);
-                    }
-                    return;
-                }
-                if cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE") || cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE") {
-                    tracing::debug!(cmd = %String::from_utf8_lossy(cmd), "UNSUBSCRIBE/PUNSUBSCRIBE");
-                    for channel in &args[1..] {
-                        ctx.broadcaster.unsubscribe(ctx.client_id, channel);
-                    }
-                    buf.put_slice(RESP_EMPTY_ARRAY);
-                    return;
-                }
-            }
             12 => {
                 if cmd.eq_ignore_ascii_case(b"SISMEMBER") {
                     if args.len() < 3 {
                         resp_write_error(buf, b"ERR wrong number of arguments");
                         return;
                     }
-                    tracing::debug!(key = %String::from_utf8_lossy(args[1]), member = %String::from_utf8_lossy(args[2]), "SISMEMBER");
                     match ctx.storage.sismember(args[1], args[2]) {
                         Ok(true) => buf.put_slice(RESP_ONE),
                         Ok(false) => buf.put_slice(RESP_ZERO),
@@ -1843,7 +1712,6 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
                         resp_write_error(buf, b"ERR wrong number of arguments");
                         return;
                     }
-                    tracing::debug!(key = %String::from_utf8_lossy(args[1]), "SMEMBERS");
                     match ctx.storage.smembers(args[1]) {
                         Ok(members) => {
                             resp_write_array_header(buf, members.len());
@@ -1862,7 +1730,6 @@ ctx.debug(format!("{} -> OK (stub)", cmd_upper));
         }
 
         // Fallback to string-based command processor for less common commands
-        tracing::debug!(cmd = %String::from_utf8_lossy(cmd), args_count = args.len(), "FALLBACK -> process_command");
         let args_str: Vec<String> = args.iter().map(|a| {
             match std::str::from_utf8(a) {
                 Ok(s) => s.to_owned(),

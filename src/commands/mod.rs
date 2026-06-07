@@ -83,10 +83,10 @@ pub fn dispatch_command(ctx: &CommandContext, args: &[RespValue]) -> RespValue {
 
             match ttl {
                 Some(d) => {
-                    ctx.storage.set_with_ttl(key, StorageValue::String(val), d);
+                    ctx.storage.set_with_ttl(key, StorageValue::String(val.into()), d);
                 }
                 None => {
-                    ctx.storage.set(key, StorageValue::String(val));
+                    ctx.storage.set(key, StorageValue::String(val.into()));
                 }
             }
             RespValue::SimpleString("OK".to_string())
@@ -98,7 +98,7 @@ pub fn dispatch_command(ctx: &CommandContext, args: &[RespValue]) -> RespValue {
                 Err(e) => return e,
             };
             match ctx.storage.get(&key) {
-                Some(StorageValue::String(s)) => RespValue::BulkString(s),
+                Some(StorageValue::String(s)) => RespValue::BulkString(s.to_vec()),
                 Some(_) => RespValue::Error("ERR wrong type for key".to_string()),
                 None => RespValue::Null,
             }
@@ -209,7 +209,7 @@ pub fn dispatch_command(ctx: &CommandContext, args: &[RespValue]) -> RespValue {
                     Ok(v) => v,
                     Err(e) => return e,
                 };
-                pairs.push((key, StorageValue::String(val)));
+                pairs.push((key, StorageValue::String(val.into())));
                 i += 2;
             }
             ctx.storage.mset(pairs);
@@ -221,7 +221,7 @@ pub fn dispatch_command(ctx: &CommandContext, args: &[RespValue]) -> RespValue {
             for i in 1..args.len() {
                 if let Ok(key) = extract_arg(&args, i) {
                     match ctx.storage.get(&key) {
-                        Some(StorageValue::String(s)) => results.push(RespValue::BulkString(s)),
+                        Some(StorageValue::String(s)) => results.push(RespValue::BulkString(s.to_vec())),
                         _ => results.push(RespValue::Null),
                     }
                 } else {
